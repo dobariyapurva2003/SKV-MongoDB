@@ -1,0 +1,14 @@
+python -m venv venv
+venv\Scripts\activate
+pip install -r requirements.txt
+#For testing
+python -m unittest tests/test_psdb.py
+#For CLI testing
+$env:PYTHONPATH="."
+python client/client.py insert --key user3 --value '{\"name\": \"Charlie\", \"email\": \"charlie@example.com\"}'
+python client/client.py find --key user3
+python client/client.py update --key user3 --value '{\"name\": \"Charlie_updated\", \"email\": \"charlie@example.com\"}'
+python client/client.py delete --key user3
+
+
+
