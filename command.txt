@@ -1,3 +1,42 @@
 python -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. database.proto
 pyhton worker.py
-#on different terminal : python master.py
+# on different terminal : python master.py
+# input formate : 
+python master.py
+Master Node - Distributed JSON Database CLI
+Database commands: create_db, use_db, list_db, delete_db
+Document commands: create, read, read_all, query, update, delete, clear
+Other commands: exit
+
+Enter command: use_db
+Enter database name to use: user
+Using database 'user'
+
+Enter command: create
+Enter document as JSON:
+> {"name" : "Hina" , "age" : 34 , "email": "hina2@gmail.com"}
+Enter custom ID (leave empty to generate): 
+Document created with ID: 4217d9a4-f343-4d56-a9cb-2a3a68baa851
+
+Enter command: read_all
+Found 2 documents:
+{
+  "name": "Pina",
+  "age": 26,
+  "email": "pina@gmail.com",
+  "_id": "78a45200-6b61-4bc0-8615-2430b7397777",
+  "_created_at": "2025-04-06T19:05:12.766379",
+  "_updated_at": "2025-04-06T23:08:57.449190"
+}
+----------------------------------------
+{
+  "name": "Hina",
+  "age": 34,
+  "email": "hina2@gmail.com",
+  "_id": "4217d9a4-f343-4d56-a9cb-2a3a68baa851",
+  "_created_at": "2025-04-06T23:18:56.009062",
+  "_updated_at": "2025-04-06T23:18:56.009062"
+}
+----------------------------------------
+
+Enter command:
