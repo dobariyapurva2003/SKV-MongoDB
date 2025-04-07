@@ -17,6 +17,12 @@ service DatabaseService {
     rpc UpdateDocument (UpdateRequest) returns (OperationResponse);
     rpc DeleteDocument (DocumentID) returns (OperationResponse);
     rpc ClearDatabase (DatabaseName) returns (OperationResponse);
+
+    // Shard management
+    rpc GetShardLocations (DatabaseName) returns (WorkerList);
+
+    // ... existing RPCs ...
+    rpc ListWorkers (Empty) returns (WorkerList);
 }
 
 message Empty {}
@@ -63,4 +69,8 @@ message UpdateRequest {
 message OperationResponse {
     bool success = 1;
     string message = 2;
+}
+
+message WorkerList {
+    repeated string workers = 1;
 }
