@@ -26,9 +26,8 @@ class MasterNode:
     def __init__(self):
         self.workers = {}  # {worker_address: WorkerNode}
         self.database_assignments = {}  # {db_name: primary_worker_address}
+        self.document_shards = {}  # {db_name: {doc_id: worker_address}}
         self.lock = threading.Lock()
-        
-        # Start health check thread
         self.health_thread = threading.Thread(target=self._health_check)
         self.health_thread.daemon = True
         self.health_thread.start()
@@ -49,8 +48,43 @@ class MasterNode:
         return False
     
     def get_primary_worker(self, db_name):
-        with self.lock:
-            return self.workers.get(self.database_assignments.get(db_name))
+        return self.workers.get(self.database_assignments.get(db_name))
+        
+    def get_document_worker(self, db_name, doc_id):
+            if db_name not in self.document_shards:
+                self.document_shards[db_name] = {}
+            
+            if doc_id not in self.document_shards[db_name]:
+                # Assign document to worker using consistent hashing
+                if not self.workers:
+                    return None
+                
+                workers = sorted(self.workers.keys())
+                hash_val = int(hashlib.md5(doc_id.encode()).hexdigest(), 16)
+                worker_idx = hash_val % len(workers)
+                self.document_shards[db_name][doc_id] = workers[worker_idx]
+            
+            return self.document_shards[db_name][doc_id]
+
+    def get_document_replicas(self, db_name, doc_id, replica_count=1):
+            primary = self.get_document_worker(db_name, doc_id)
+            if not primary:
+                print(f"not primary")
+                return []
+            
+            workers = sorted(self.workers.keys())
+            if len(workers) <= 1:
+                print(f"1 worker")
+                return []
+            
+            primary_idx = workers.index(primary)
+            replicas = []
+            for i in range(1, replica_count + 1):
+                replica_idx = (primary_idx + i) % len(workers)
+                if replica_idx != primary_idx:
+                    replicas.append(workers[replica_idx])
+            
+            return replicas
     
     def _health_check(self):
         while True:
@@ -77,6 +111,10 @@ class MasterService(database_pb2_grpc.DatabaseServiceServicer):
             workers = list(self.master.workers.keys())
         return database_pb2.WorkerList(workers=workers)
     
+    def GetDocumentReplicas(self, request, context):
+        replicas = self.master.get_document_replicas(request.db_name, request.doc_id)
+        return database_pb2.WorkerList(workers=replicas)
+    
     def CreateDatabase(self, request, context):
         worker = self._select_worker_for_db(request.name)
         if not worker:
@@ -100,6 +138,13 @@ class MasterService(database_pb2_grpc.DatabaseServiceServicer):
         workers = sorted(self.master.workers.values(), key=lambda w: hash(w.address))
         return workers[hash_val % len(workers)]
     
+    def GetPrimaryWorker(self, request, context):
+        worker = self.master.get_primary_worker(request.name)
+        if not worker:
+            context.set_code(grpc.StatusCode.NOT_FOUND)
+            return database_pb2.Worker()
+        return database_pb2.Worker(worker=worker.address)
+
     def UseDatabase(self, request, context):
         worker = self.master.get_primary_worker(request.name)
         if not worker:
@@ -130,23 +175,62 @@ class MasterService(database_pb2_grpc.DatabaseServiceServicer):
     
     def CreateDocument(self, request, context):
         logger.info(f"CreateDocument: db_name={request.db_name}, doc_id={request.doc_id}")
+        
+        # Get primary worker for this database
         worker = self.master.get_primary_worker(request.db_name)
         if not worker:
-            logger.error(f"No worker found for db_name={request.db_name}")
+            logger.error(f"No primary worker found for db_name={request.db_name}")
             context.set_code(grpc.StatusCode.NOT_FOUND)
             return database_pb2.DocumentID()
         
         try:
-            logger.info(f"Forwarding CreateDocument to worker: {worker.address}")
-            response = worker.stub.CreateDocument(request)
-            logger.info(f"Response from worker: {response.doc_id}")
+            # Forward to primary worker with timeout
+            logger.info(f"Forwarding CreateDocument to primary worker: {worker.address}")
+            response = worker.stub.CreateDocument(
+                request,
+                timeout=5  # 5 second timeout
+            )
+            
+            # Only attempt replication if primary write succeeded
+            if response.doc_id:
+                replicas = self.master.get_document_replicas(request.db_name, response.doc_id)
+                print(replicas)
+                for replica_addr in replicas:
+                    try:
+                        replica_worker = self.master.workers[replica_addr]
+                        repon = replica_worker.stub.ReplicateDocument(
+                            database_pb2.ReplicateRequest(
+                                db_name=request.db_name,
+                                doc_id=response.doc_id,
+                                document=request.document
+                            ),
+                            timeout=3  # Shorter timeout for replicas
+                        )
+                    except Exception as e:
+                        logger.error(f"Failed to replicate to {replica_addr}: {str(e)}")
+            
             return response
+            
+        except grpc.RpcError as e:
+            logger.error(f"RPC error forwarding to {worker.address}: {e.code()}: {e.details()}")
+            context.set_code(e.code())
+            context.set_details(e.details())
+            return database_pb2.DocumentID()
         except Exception as e:
-            logger.error(f"Error forwarding to {worker.address}: {str(e)}")
+            logger.error(f"Unexpected error: {str(e)}", exc_info=True)
             context.set_code(grpc.StatusCode.INTERNAL)
             context.set_details(str(e))
             return database_pb2.DocumentID()
     
+    # [Add new replication RPC method]
+    def GetDocumentLocation(self, request, context):
+        worker_addr = self.master.get_document_worker(request.db_name, request.doc_id)
+        if not worker_addr:
+            context.set_code(grpc.StatusCode.NOT_FOUND)
+            return database_pb2.Worker()
+        return database_pb2.Worker(worker=worker_addr)
+    
+
     def ReadDocument(self, request, context):
         worker = self.master.get_primary_worker(request.db_name)
         if not worker:
@@ -198,11 +282,26 @@ class MasterService(database_pb2_grpc.DatabaseServiceServicer):
             return database_pb2.DocumentList()
 
     def UpdateDocument(self, request, context):
-        worker = self.master.get_primary_worker(request.db_name)
+        logger.info(f"UpdateDocument: db_name={request.db_name}, doc_id={request.doc_id}")
+        
+        # Find which worker has this document
+        worker_addr = self.master.get_document_worker(request.db_name, request.doc_id)
+        if not worker_addr:
+            context.set_code(grpc.StatusCode.NOT_FOUND)
+            return database_pb2.OperationResponse(success=False, message="Document not found")
+        
+        worker = self.master.workers.get(worker_addr)
         if not worker:
             context.set_code(grpc.StatusCode.NOT_FOUND)
-            return database_pb2.OperationResponse(success=False, message="Database not found")
-        return worker.stub.UpdateDocument(request)
+            return database_pb2.OperationResponse(success=False, message="Worker not found")
+        
+        try:
+            print(f"update request sent to wroekr : " ,worker)
+            return worker.stub.UpdateDocument(request)
+        except Exception as e:
+            logger.error(f"Error updating document: {str(e)}")
+            context.set_code(grpc.StatusCode.INTERNAL)
+            return database_pb2.OperationResponse(success=False, message=str(e))
 
     def DeleteDocument(self, request, context):
         worker = self.master.get_primary_worker(request.db_name)
