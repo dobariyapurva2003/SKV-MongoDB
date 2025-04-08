@@ -62,17 +62,22 @@ class DatabaseClient:
             return "No database selected. Use 'use <db_name>' first."
         try:
             json.loads(document_json)  # Validate JSON
-            response = self.stub.CreateDocument(database_pb2.DocumentRequest(
-                db_name=self.current_db,
-                document=document_json,
-                doc_id=doc_id
-            ))
+            response = self.stub.CreateDocument(
+                database_pb2.DocumentRequest(
+                    db_name=self.current_db,
+                    document=document_json,
+                    doc_id=doc_id
+                ),
+                timeout=10  # 10 second timeout
+            )
             return f"Created document with ID: {response.doc_id}"
+        except grpc.RpcError as e:
+            return f"Error: {e.code().name}: {e.details()}"
         except json.JSONDecodeError:
             return "Invalid JSON format"
         except Exception as e:
-            return str(e)
-
+            return f"Unexpected error: {str(e)}"
+    
     def read_document(self, doc_id):
         if not self.current_db:
             return "No database selected. Use 'use <db_name>' first."
