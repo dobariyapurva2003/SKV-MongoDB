@@ -82,6 +82,7 @@ class DatabaseManager:
     def __init__(self):
         self.databases = {}
         self.current_db = None
+        
     
     def create_database(self, db_name):
         if db_name in self.databases:
@@ -112,6 +113,16 @@ class DatabaseService(database_pb2_grpc.DatabaseServiceServicer):
         self.master_channel = grpc.insecure_channel("localhost:50050")
         self.master_stub = database_pb2_grpc.DatabaseServiceStub(self.master_channel)
         self._discover_workers()
+        self.replica_channels = {}  # Cache for replica channels
+
+    def _check_master_connection(self):
+        for _ in range(3):  # Retry 3 times
+            try:
+                self.master_stub.ListWorkers(database_pb2.Empty(), timeout=2)
+                return True
+            except:
+                time.sleep(1)
+        return False
 
     def _discover_workers(self):
         for _ in range(5):  # Retry 5 times
@@ -160,42 +171,129 @@ class DatabaseService(database_pb2_grpc.DatabaseServiceServicer):
     
     def CreateDocument(self, request, context):
         try:
-            # Auto-select database if not set
+            logger.info(f"CreateDocument received for db={request.db_name}, doc_id={request.doc_id}")
+            
             if not self.manager.current_db or self.manager.current_db['db'].db_file != f"{request.db_name}.json":
-                logger.info(f"Auto-selecting database: {request.db_name}")
                 self.manager.use_database(request.db_name)
             
-            doc = json.loads(request.document)
             doc_id = request.doc_id or str(uuid.uuid4())
+            doc_data = {
+                **json.loads(request.document),
+                '_id': doc_id,
+                '_created_at': datetime.now().isoformat(),
+                '_updated_at': datetime.now().isoformat(),
+                '_primary': True
+            }
             
-            shard_worker = self._select_shard_worker(doc_id)
-            logger.info(f"Document {doc_id} assigned to worker {shard_worker}")
+            # Store document locally
+            self.manager.current_db['db'].create_document(doc_data, doc_id)
+            logger.info(f"Document {doc_id} created successfully")
             
-            if shard_worker == self.worker_address:
-                self.manager.current_db['db'].create_document({
-                    **doc,
-                    '_id': doc_id,
-                    '_created_at': datetime.now().isoformat(),
-                    '_updated_at': datetime.now().isoformat()
-                }, doc_id)
-            else:
-                if shard_worker not in self.manager.current_db['shards'].worker_channels:
-                    self.manager.current_db['shards'].worker_channels[shard_worker] = grpc.insecure_channel(shard_worker)
-                stub = database_pb2_grpc.DatabaseServiceStub(
-                    self.manager.current_db['shards'].worker_channels[shard_worker]
-                )
-                response = stub.CreateDocument(request)
-                if not response.doc_id:
-                    raise ValueError("Failed to create document on shard worker")
-                doc_id = response.doc_id
-            
-            self.manager.current_db['shards'].add_shard(doc_id, shard_worker)
             return database_pb2.DocumentID(doc_id=doc_id)
+            
+        except json.JSONDecodeError as e:
+            logger.error(f"Invalid JSON: {str(e)}")
+            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+            context.set_details("Invalid JSON format")
+            return database_pb2.DocumentID()
         except Exception as e:
-            logger.error(f"Error creating document: {str(e)}")
+            logger.error(f"Error creating document: {str(e)}", exc_info=True)
             context.set_code(grpc.StatusCode.INTERNAL)
             context.set_details(str(e))
             return database_pb2.DocumentID()
+    
+    def ReplicateDocument(self, request, context):
+        """Handle document replication from primary"""
+        try:
+            if not self.manager.current_db or self.manager.current_db['db'].db_file != f"{request.db_name}.json":
+                self.manager.use_database(request.db_name)
+            
+            doc_data = json.loads(request.document)  # Full document from primary
+            doc_id = request.doc_id
+            
+            # If document exists, update it; otherwise, create it
+            if doc_id in self.manager.current_db['db'].data:
+                print(f"updated replicas")
+                current_doc = self.manager.current_db['db'].data[doc_id]
+                current_doc.update(doc_data)
+                current_doc['_primary'] = False  # Ensure it remains a replica
+                current_doc['_updated_at'] = datetime.now().isoformat()
+            else:
+                doc_data['_primary'] = False
+                doc_data['_created_at'] = datetime.now().isoformat()
+                doc_data['_updated_at'] = datetime.now().isoformat()
+                self.manager.current_db['db'].create_document(doc_data, doc_id)
+            
+            logger.info(f"Document {doc_id} replicated successfully on {self.worker_address}")
+            return database_pb2.OperationResponse(success=True, message="Document replicated")
+        except Exception as e:
+            logger.error(f"Error replicating document: {str(e)}")
+            context.set_code(grpc.StatusCode.INTERNAL)
+            context.set_details(str(e))
+            return database_pb2.OperationResponse(success=False, message=str(e))
+        
+    def _replicate_document(self, db_name, doc_id, document_json):
+        """Helper to replicate document to all replicas"""
+        try:
+            replicas = self.master_stub.GetDocumentReplicas(
+                database_pb2.DocumentID(db_name=db_name, doc_id=doc_id)
+            ).workers
+            
+            for replica_addr in replicas:
+                if replica_addr != self.worker_address:  # Skip self
+                    try:
+                        if replica_addr not in self.replica_channels:
+                            self.replica_channels[replica_addr] = grpc.insecure_channel(replica_addr)
+                        
+                        stub = database_pb2_grpc.DatabaseServiceStub(self.replica_channels[replica_addr])
+                        response = stub.ReplicateDocument(
+                            database_pb2.ReplicateRequest(
+                                db_name=db_name,
+                                doc_id=doc_id,
+                                document=document_json
+                            ),
+                            timeout=3
+                        )
+                        logger.info(f"Replicated to {replica_addr}: {response.message}")
+                    except Exception as e:
+                        logger.error(f"Failed to replicate to {replica_addr}: {str(e)}")
+        except Exception as e:
+            logger.error(f"Failed to get replicas from master: {str(e)}")
+
+
+
+    def ReadDocument(self, request, context):
+        try:
+            if not self.manager.current_db or self.manager.current_db['db'].db_file != f"{request.db_name}.json":
+                self.manager.use_database(request.db_name)
+            
+            # Check if we have the document locally
+            doc = self.manager.current_db['db'].read_document(request.doc_id)
+            if doc:
+                return database_pb2.DocumentResponse(document=json.dumps(doc))
+            
+            # If not found locally, check with master for location
+            worker_response = self.master_stub.GetDocumentLocation(
+                database_pb2.DocumentID(
+                    db_name=request.db_name,
+                    doc_id=request.doc_id
+                ))
+            
+            if not worker_response.worker:
+                context.set_code(grpc.StatusCode.NOT_FOUND)
+                return database_pb2.DocumentResponse()
+            
+            # Forward to the correct worker
+            if worker_response.worker not in self.replica_channels:
+                self.replica_channels[worker_response.worker] = grpc.insecure_channel(worker_response.worker)
+            
+            stub = database_pb2_grpc.DatabaseServiceStub(self.replica_channels[worker_response.worker])
+            return stub.ReadDocument(request)
+            
+        except Exception as e:
+            context.set_code(grpc.StatusCode.INTERNAL)
+            context.set_details(str(e))
+            return database_pb2.DocumentResponse()
         
     def _select_shard_worker(self, doc_id):
         if not self.known_workers:
@@ -209,36 +307,7 @@ class DatabaseService(database_pb2_grpc.DatabaseServiceServicer):
                 return worker
         return worker_hashes[0][1]
 
-    def ReadDocument(self, request, context):
-        try:
-            if not self.manager.current_db or self.manager.current_db['db'].db_file != f"{request.db_name}.json":
-                self.manager.use_database(request.db_name)
-            
-            shard_worker = self.manager.current_db['shards'].get_shard_worker(request.doc_id)
-            if not shard_worker:
-                context.set_code(grpc.StatusCode.NOT_FOUND)
-                return database_pb2.DocumentResponse()
-            
-            if shard_worker == self.worker_address:
-                doc = self.manager.current_db['db'].read_document(request.doc_id)
-            else:
-                channel = self.manager.current_db['shards'].worker_channels[shard_worker]
-                stub = database_pb2_grpc.DatabaseServiceStub(channel)
-                response = stub.ReadDocument(database_pb2.DocumentID(
-                    db_name=request.db_name,
-                    doc_id=request.doc_id
-                ))
-                doc = json.loads(response.document) if response.document else None
-            
-            if doc:
-                return database_pb2.DocumentResponse(document=json.dumps(doc))
-            context.set_code(grpc.StatusCode.NOT_FOUND)
-            return database_pb2.DocumentResponse()
-        except Exception as e:
-            context.set_code(grpc.StatusCode.INTERNAL)
-            context.set_details(str(e))
-            return database_pb2.DocumentResponse()
-    
+   
     def ReadAllDocuments(self, request, context):
         try:
             if not self.manager.current_db or self.manager.current_db['db'].db_file != f"{request.name}.json":
@@ -266,41 +335,60 @@ class DatabaseService(database_pb2_grpc.DatabaseServiceServicer):
     
     def UpdateDocument(self, request, context):
         try:
+            logger.info(f"UpdateDocument: db={request.db_name}, doc_id={request.doc_id}")
+            
             if not self.manager.current_db or self.manager.current_db['db'].db_file != f"{request.db_name}.json":
                 self.manager.use_database(request.db_name)
             
-            shard_worker = self.manager.current_db['shards'].get_shard_worker(request.doc_id)
-            if not shard_worker and request.create_if_missing:
-                return self.CreateDocument(database_pb2.DocumentRequest(
-                    db_name=request.db_name,
-                    document=request.updates,
-                    doc_id=request.doc_id
-                ), context)
-            
-            if not shard_worker:
+            # Check if document exists locally
+            if request.doc_id not in self.manager.current_db['db'].data:
                 context.set_code(grpc.StatusCode.NOT_FOUND)
                 return database_pb2.OperationResponse(success=False, message="Document not found")
             
-            if shard_worker == self.worker_address:
-                success = self.manager.current_db['db'].update_document(
-                    request.doc_id,
-                    json.loads(request.updates),
-                    request.create_if_missing
-                )
-            else:
-                channel = self.manager.current_db['shards'].worker_channels[shard_worker]
-                stub = database_pb2_grpc.DatabaseServiceStub(channel)
-                response = stub.UpdateDocument(request)
-                return response
+            # Apply updates
+            updates = json.loads(request.updates)
+            current_doc = self.manager.current_db['db'].data[request.doc_id]
+            current_doc.update(updates)
+            current_doc['_updated_at'] = datetime.now().isoformat()
             
-            return database_pb2.OperationResponse(
-                success=success,
-                message="Document updated" if success else "Document not found"
-            )
+            self.manager.current_db['db']._save()
+            
+            # If this is primary, replicate to replicas
+            if current_doc.get('_primary', False):
+                try:
+                    replicas = self.master_stub.GetDocumentReplicas(
+                        database_pb2.DocumentID(
+                            db_name=request.db_name,
+                            doc_id=request.doc_id
+                        )).workers
+                    
+                    for replica_addr in replicas:
+                        try:
+                            if replica_addr not in self.replica_channels:
+                                self.replica_channels[replica_addr] = grpc.insecure_channel(replica_addr)
+                            
+                            stub = database_pb2_grpc.DatabaseServiceStub(self.replica_channels[replica_addr])
+                            stub.ReplicateDocument(database_pb2.ReplicateRequest(
+                                db_name=request.db_name,
+                                doc_id=request.doc_id,
+                                document=json.dumps(updates)
+                            ))
+                        except Exception as e:
+                            logger.error(f"Failed to replicate to {replica_addr}: {str(e)}")
+                
+                except Exception as e:
+                    logger.error(f"Failed to get replicas: {str(e)}")
+            
+            return database_pb2.OperationResponse(success=True, message="Document updated")
+        
+        except json.JSONDecodeError:
+            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+            return database_pb2.OperationResponse(success=False, message="Invalid JSON format")
         except Exception as e:
+            logger.error(f"Error updating document: {str(e)}", exc_info=True)
             context.set_code(grpc.StatusCode.INTERNAL)
             return database_pb2.OperationResponse(success=False, message=str(e))
-    
+
     def DeleteDocument(self, request, context):
         try:
             if not self.manager.current_db or self.manager.current_db['db'].db_file != f"{request.db_name}.json":
