@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import threading
 import uuid
 from datetime import datetime
 from concurrent import futures
@@ -128,6 +129,10 @@ class DatabaseService(database_pb2_grpc.DatabaseServiceServicer):
         self.master_stub = database_pb2_grpc.DatabaseServiceStub(self.master_channel)
         self._discover_workers()
         self.replica_channels = {}  # Cache for replica channels
+        # Heartbeat thread
+        self.heartbeat_thread = threading.Thread(target=self._send_heartbeats)
+        self.heartbeat_thread.daemon = True
+        self.heartbeat_thread.start()
 
     def _check_master_connection(self):
         for _ in range(3):  # Retry 3 times
@@ -151,6 +156,25 @@ class DatabaseService(database_pb2_grpc.DatabaseServiceServicer):
         else:
             self.known_workers = ["localhost:50051", "localhost:50052"]
             logger.info(f"Fallback to default workers: {self.known_workers}")
+
+    def _send_heartbeats(self):
+        """Thread to send periodic heartbeat messages to master"""
+        while True:
+            try:
+                response = self.master_stub.Heartbeat(
+                    database_pb2.HeartbeatRequest(
+                        worker_address=self.worker_address,
+                        timestamp=int(time.time())
+                    )
+                )
+                if response.acknowledged:
+                    logger.info(f"Heartbeat sent to master from {self.worker_address}")
+                else:
+                    logger.warning(f"Heartbeat not acknowledged by master from {self.worker_address}")
+            except Exception as e:
+                logger.error(f"Failed to send heartbeat from {self.worker_address}: {str(e)}")
+            time.sleep(5)  # Send heartbeat every 5 seconds
+            
 
     def GetLoadInfo(self, request, context):
         """Return information about this worker's load"""
