@@ -39,7 +39,19 @@ service DatabaseService {
     // Primary management (NEW)
     rpc GetDocumentPrimary (DocumentID) returns (Worker);
     rpc SetDocumentPrimary (SetPrimaryRequest) returns (OperationResponse);  // Optional
+    // Heartbeat mechanism (NEW)
+    rpc Heartbeat (HeartbeatRequest) returns (HeartbeatResponse);
 
+}
+
+// NEW message for heartbeat
+message HeartbeatRequest {
+    string worker_address = 1;
+    int64 timestamp = 2;  // Unix timestamp in seconds
+}
+
+message HeartbeatResponse {
+    bool acknowledged = 1;
 }
 
 // NEW message for primary management
