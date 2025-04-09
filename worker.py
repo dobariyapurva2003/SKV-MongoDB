@@ -82,7 +82,21 @@ class DatabaseManager:
     def __init__(self):
         self.databases = {}
         self.current_db = None
+        self.replica_metadata = {}  # {db_name: {doc_id: [replica_workers]}}
         
+    
+    def add_replica(self, db_name, doc_id, worker_address):
+        """Track which workers have replicas of which documents"""
+        if db_name not in self.replica_metadata:
+            self.replica_metadata[db_name] = {}
+        if doc_id not in self.replica_metadata[db_name]:
+            self.replica_metadata[db_name][doc_id] = []
+        if worker_address not in self.replica_metadata[db_name][doc_id]:
+            self.replica_metadata[db_name][doc_id].append(worker_address)
+    
+    def get_replicas(self, db_name, doc_id):
+        """Get list of workers with replicas of this document"""
+        return self.replica_metadata.get(db_name, {}).get(doc_id, [])
     
     def create_database(self, db_name):
         if db_name in self.databases:
@@ -138,6 +152,17 @@ class DatabaseService(database_pb2_grpc.DatabaseServiceServicer):
             self.known_workers = ["localhost:50051", "localhost:50052"]
             logger.info(f"Fallback to default workers: {self.known_workers}")
 
+    def GetLoadInfo(self, request, context):
+        """Return information about this worker's load"""
+        replica_count = sum(len(docs) for docs in self.manager.replica_metadata.values())
+        return database_pb2.LoadInfo(replica_count=replica_count)
+    
+    def DecrementReplicaCount(self, request, context):
+        """Decrement the reported replica count (used when replication fails)"""
+        # This worker doesn't actually track its own count in master,
+        # but we implement it for protocol completeness
+        return database_pb2.OperationResponse(success=True)
+
     def CreateDatabase(self, request, context):
         try:
             self.manager.create_database(request.name)
@@ -182,54 +207,123 @@ class DatabaseService(database_pb2_grpc.DatabaseServiceServicer):
                 '_id': doc_id,
                 '_created_at': datetime.now().isoformat(),
                 '_updated_at': datetime.now().isoformat(),
-                '_primary': True
+                '_primary': True,
+                '_version': 1  # Add version counter
             }
             
             # Store document locally
             self.manager.current_db['db'].create_document(doc_data, doc_id)
-            logger.info(f"Document {doc_id} created successfully")
+            
+            # Get replica workers from master (load-balanced)
+            replicas = self.master_stub.GetDocumentReplicas(
+                database_pb2.DocumentID(db_name=request.db_name, doc_id=doc_id))
+            
+            # Replicate to each replica worker
+            successful_replicas = []
+            for replica_addr in replicas.workers:
+                try:
+                    if replica_addr not in self.replica_channels:
+                        self.replica_channels[replica_addr] = grpc.insecure_channel(replica_addr)
+                    
+                    stub = database_pb2_grpc.DatabaseServiceStub(self.replica_channels[replica_addr])
+                    response = stub.ReplicateDocument(
+                        database_pb2.ReplicateRequest(
+                            db_name=request.db_name,
+                            doc_id=doc_id,
+                            document=json.dumps(doc_data)
+                    ))
+                    if response.success:
+                        self.manager.add_replica(request.db_name, doc_id, replica_addr)
+                        successful_replicas.append(replica_addr)
+                    else:
+                        # If replication fails, inform master to decrement count
+                        self.master_stub.decrement_replica_count(database_pb2.Worker(worker=replica_addr))
+                except Exception as e:
+                    logger.error(f"Failed to replicate to {replica_addr}: {str(e)}")
+                    self.master_stub.decrement_replica_count(database_pb2.Worker(worker=replica_addr))
+            
+            # If we couldn't create enough replicas, try to compensate
+            if len(successful_replicas) < min(3, len(replicas.workers)):
+                self._compensate_replicas(request.db_name, doc_id, doc_data, successful_replicas)
             
             return database_pb2.DocumentID(doc_id=doc_id)
             
-        except json.JSONDecodeError as e:
-            logger.error(f"Invalid JSON: {str(e)}")
-            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
-            context.set_details("Invalid JSON format")
-            return database_pb2.DocumentID()
         except Exception as e:
-            logger.error(f"Error creating document: {str(e)}", exc_info=True)
+            logger.error(f"Error creating document: {str(e)}")
             context.set_code(grpc.StatusCode.INTERNAL)
             context.set_details(str(e))
             return database_pb2.DocumentID()
     
+    def _compensate_replicas(self, db_name, doc_id, doc_data, existing_replicas):
+        """Try to create additional replicas if initial replication failed"""
+        try:
+            # Get current list of all workers
+            workers = self.master_stub.ListWorkers(database_pb2.Empty()).workers
+            available_workers = [w for w in workers 
+                              if w != self.worker_address 
+                              and w not in existing_replicas]
+            
+            # Sort by load (we need to get load info from master)
+            load_info = {}
+            for w in available_workers:
+                try:
+                    channel = grpc.insecure_channel(w)
+                    stub = database_pb2_grpc.DatabaseServiceStub(channel)
+                    response = stub.GetLoadInfo(database_pb2.Empty())
+                    load_info[w] = response.replica_count
+                except:
+                    continue
+            
+            # Sort workers by load
+            sorted_workers = sorted(load_info.keys(), key=lambda w: load_info[w])
+            
+            # Try to create additional replicas on least loaded workers
+            needed = min(3, len(workers)-1) - len(existing_replicas)
+            for w in sorted_workers[:needed]:
+                try:
+                    if w not in self.replica_channels:
+                        self.replica_channels[w] = grpc.insecure_channel(w)
+                    
+                    stub = database_pb2_grpc.DatabaseServiceStub(self.replica_channels[w])
+                    response = stub.ReplicateDocument(
+                        database_pb2.ReplicateRequest(
+                            db_name=db_name,
+                            doc_id=doc_id,
+                            document=json.dumps(doc_data)
+                    ))
+                    if response.success:
+                        self.manager.add_replica(db_name, doc_id, w)
+                except Exception as e:
+                    logger.error(f"Failed compensatory replication to {w}: {str(e)}")
+        except Exception as e:
+            logger.error(f"Error in compensatory replication: {str(e)}")
+
     def ReplicateDocument(self, request, context):
-        """Handle document replication from primary"""
+        """Handle document replication including primary status changes"""
         try:
             if not self.manager.current_db or self.manager.current_db['db'].db_file != f"{request.db_name}.json":
                 self.manager.use_database(request.db_name)
             
-            doc_data = json.loads(request.document)  # Full document from primary
+            doc_data = json.loads(request.document)
             doc_id = request.doc_id
             
             # If document exists, update it; otherwise, create it
             if doc_id in self.manager.current_db['db'].data:
-                print(f"updated replicas")
                 current_doc = self.manager.current_db['db'].data[doc_id]
                 current_doc.update(doc_data)
-                current_doc['_primary'] = False  # Ensure it remains a replica
+                # Preserve primary status if not being explicitly set
+                if '_primary' in doc_data:
+                    current_doc['_primary'] = doc_data['_primary']
                 current_doc['_updated_at'] = datetime.now().isoformat()
             else:
-                doc_data['_primary'] = False
+                # New document - set primary status from request
                 doc_data['_created_at'] = datetime.now().isoformat()
                 doc_data['_updated_at'] = datetime.now().isoformat()
                 self.manager.current_db['db'].create_document(doc_data, doc_id)
             
-            logger.info(f"Document {doc_id} replicated successfully on {self.worker_address}")
-            return database_pb2.OperationResponse(success=True, message="Document replicated")
+            return database_pb2.OperationResponse(success=True)
         except Exception as e:
-            logger.error(f"Error replicating document: {str(e)}")
             context.set_code(grpc.StatusCode.INTERNAL)
-            context.set_details(str(e))
             return database_pb2.OperationResponse(success=False, message=str(e))
         
     def _replicate_document(self, db_name, doc_id, document_json):
@@ -333,6 +427,7 @@ class DatabaseService(database_pb2_grpc.DatabaseServiceServicer):
             context.set_details(str(e))
             return database_pb2.DocumentList()
     
+
     def UpdateDocument(self, request, context):
         try:
             logger.info(f"UpdateDocument: db={request.db_name}, doc_id={request.doc_id}")
@@ -340,54 +435,97 @@ class DatabaseService(database_pb2_grpc.DatabaseServiceServicer):
             if not self.manager.current_db or self.manager.current_db['db'].db_file != f"{request.db_name}.json":
                 self.manager.use_database(request.db_name)
             
-            # Check if document exists locally
-            if request.doc_id not in self.manager.current_db['db'].data:
+            # Check if we're the primary worker for this document
+            current_doc = self.manager.current_db['db'].read_document(request.doc_id)
+            if not current_doc:
                 context.set_code(grpc.StatusCode.NOT_FOUND)
                 return database_pb2.OperationResponse(success=False, message="Document not found")
             
-            # Apply updates
+            # If we're not primary, forward to primary
+            if not current_doc.get('_primary', False):
+                primary_worker = self.master_stub.GetDocumentPrimary(
+                    database_pb2.DocumentID(db_name=request.db_name, doc_id=request.doc_id)
+                ).worker
+                if not primary_worker:
+                    return database_pb2.OperationResponse(
+                        success=False,
+                        message="No primary worker found for document"
+                    )
+                
+                channel = self.replica_channels.get(primary_worker) or grpc.insecure_channel(primary_worker)
+                stub = database_pb2_grpc.DatabaseServiceStub(channel)
+                return stub.UpdateDocument(request)
+            
+            # We are the primary - perform the update
             updates = json.loads(request.updates)
-            current_doc = self.manager.current_db['db'].data[request.doc_id]
+            
+            # Apply updates locally
             current_doc.update(updates)
             current_doc['_updated_at'] = datetime.now().isoformat()
-            
+            current_doc['_version'] = current_doc.get('_version', 0) + 1
             self.manager.current_db['db']._save()
             
-            # If this is primary, replicate to replicas
-            if current_doc.get('_primary', False):
-                try:
-                    replicas = self.master_stub.GetDocumentReplicas(
-                        database_pb2.DocumentID(
-                            db_name=request.db_name,
-                            doc_id=request.doc_id
-                        )).workers
-                    
-                    for replica_addr in replicas:
-                        try:
-                            if replica_addr not in self.replica_channels:
-                                self.replica_channels[replica_addr] = grpc.insecure_channel(replica_addr)
-                            
-                            stub = database_pb2_grpc.DatabaseServiceStub(self.replica_channels[replica_addr])
-                            stub.ReplicateDocument(database_pb2.ReplicateRequest(
-                                db_name=request.db_name,
-                                doc_id=request.doc_id,
-                                document=json.dumps(updates)
-                            ))
-                        except Exception as e:
-                            logger.error(f"Failed to replicate to {replica_addr}: {str(e)}")
-                
-                except Exception as e:
-                    logger.error(f"Failed to get replicas: {str(e)}")
+            # Get all replica workers (excluding self)
+            replicas = self.master_stub.GetDocumentReplicas(
+                database_pb2.DocumentID(db_name=request.db_name, doc_id=request.doc_id)
+            ).workers
+            replica_addresses = [addr for addr in replicas if addr != self.worker_address]
             
-            return database_pb2.OperationResponse(success=True, message="Document updated")
-        
-        except json.JSONDecodeError:
-            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
-            return database_pb2.OperationResponse(success=False, message="Invalid JSON format")
+            # Prepare the replication request
+            replicate_request = database_pb2.ReplicateRequest(
+                db_name=request.db_name,
+                doc_id=request.doc_id,
+                document=json.dumps(current_doc),
+                is_update=True
+            )
+            
+            # Replicate to all secondaries (async for better performance)
+            successful_replicas = 0
+            replication_futures = []
+            
+            with futures.ThreadPoolExecutor(max_workers=5) as executor:
+                for replica_addr in replica_addresses:
+                    try:
+                        channel = self.replica_channels.get(replica_addr) or grpc.insecure_channel(replica_addr)
+                        stub = database_pb2_grpc.DatabaseServiceStub(channel)
+                        
+                        # Submit replication asynchronously
+                        future = executor.submit(
+                            stub.ReplicateDocument,
+                            replicate_request,
+                            timeout=2
+                        )
+                        replication_futures.append((replica_addr, future))
+                    except Exception as e:
+                        logger.error(f"Failed to initiate replication to {replica_addr}: {str(e)}")
+                
+                # Wait for all replications to complete
+                for replica_addr, future in replication_futures:
+                    try:
+                        response = future.result()
+                        if response.success:
+                            successful_replicas += 1
+                    except Exception as e:
+                        logger.error(f"Replication failed to {replica_addr}: {str(e)}")
+            
+            # If too many replicas failed, consider this a partial failure
+            if successful_replicas < len(replica_addresses) // 2:  # Less than half succeeded
+                logger.warning(f"Update partially failed - only {successful_replicas}/{len(replica_addresses)} replicas updated")
+                return database_pb2.OperationResponse(
+                    success=False,
+                    message=f"Primary updated but only {successful_replicas}/{len(replica_addresses)} replicas succeeded"
+                )
+            
+            return database_pb2.OperationResponse(
+                success=True,
+                message=f"Updated primary and {successful_replicas}/{len(replica_addresses)} replicas"
+            )
+            
         except Exception as e:
-            logger.error(f"Error updating document: {str(e)}", exc_info=True)
+            logger.error(f"Update failed: {str(e)}", exc_info=True)
             context.set_code(grpc.StatusCode.INTERNAL)
             return database_pb2.OperationResponse(success=False, message=str(e))
+        
 
     def DeleteDocument(self, request, context):
         try:
@@ -449,8 +587,20 @@ def serve(port):
         DatabaseService(worker_address), server)
     server.add_insecure_port(f'[::]:{port}')
     server.start()
-    print(f"Worker node running on port {port}")
+     # Register with master
+    try:
+        master_channel = grpc.insecure_channel("localhost:50050")
+        master_stub = database_pb2_grpc.DatabaseServiceStub(master_channel)
+        response = master_stub.RegisterWorker(database_pb2.Worker(worker=worker_address))
+        if response.success:
+            print(f"Worker node running on port {port} and registered with master")
+        else:
+            print(f"Worker node running on port {port} but registration failed: {response.message}")
+    except Exception as e:
+        print(f"Worker node running on port {port} but failed to register with master: {str(e)}")
+    
     server.wait_for_termination()
+    
 
 if __name__ == '__main__':
     import sys
