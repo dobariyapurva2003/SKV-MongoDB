@@ -8,6 +8,8 @@ service DatabaseService {
     rpc UseDatabase (DatabaseName) returns (OperationResponse);
     rpc ListDatabases (Empty) returns (DatabaseList);
     rpc DeleteDatabase (DatabaseName) returns (OperationResponse);
+    // Worker registration
+    rpc RegisterWorker (Worker) returns (OperationResponse);
     
     // Document operations
     rpc CreateDocument (DocumentRequest) returns (DocumentID);
@@ -17,6 +19,10 @@ service DatabaseService {
     rpc UpdateDocument (UpdateRequest) returns (OperationResponse);
     rpc DeleteDocument (DocumentID) returns (OperationResponse);
     rpc ClearDatabase (DatabaseName) returns (OperationResponse);
+
+    rpc GetLoadInfo (Empty) returns (LoadInfo);
+    rpc DecrementReplicaCount (Worker) returns (OperationResponse);
+
 
     // Shard management
     rpc GetShardLocations (DatabaseName) returns (WorkerList);
@@ -30,12 +36,28 @@ service DatabaseService {
     rpc GetDocumentLocation (DocumentID) returns (Worker);
     rpc GetDocumentReplicas (DocumentID) returns (WorkerList);  // Add this line
 
+    // Primary management (NEW)
+    rpc GetDocumentPrimary (DocumentID) returns (Worker);
+    rpc SetDocumentPrimary (SetPrimaryRequest) returns (OperationResponse);  // Optional
+
+}
+
+// NEW message for primary management
+message SetPrimaryRequest {
+    string db_name = 1;
+    string doc_id = 2;
+    string worker_address = 3;
+}
+
+message LoadInfo {
+    int32 replica_count = 1;
 }
 
 message ReplicateRequest {
     string db_name = 1;
     string doc_id = 2;
-    string document = 3;  // JSON string
+    string document = 3;
+    bool is_update = 4;
 }
 
 message Empty {}
