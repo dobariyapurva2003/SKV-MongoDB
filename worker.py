@@ -529,32 +529,71 @@ class DatabaseService(database_pb2_grpc.DatabaseServiceServicer):
 
     def DeleteDocument(self, request, context):
         try:
+            logger.info(f"DeleteDocument: db={request.db_name}, doc_id={request.doc_id}")
+
+            # Load the database if not already loaded
             if not self.manager.current_db or self.manager.current_db['db'].db_file != f"{request.db_name}.json":
                 self.manager.use_database(request.db_name)
-            
-            shard_worker = self.manager.current_db['shards'].get_shard_worker(request.doc_id)
-            if not shard_worker:
+
+            # Check if the document exists locally
+            current_doc = self.manager.current_db['db'].read_document(request.doc_id)
+            if not current_doc:
                 context.set_code(grpc.StatusCode.NOT_FOUND)
                 return database_pb2.OperationResponse(success=False, message="Document not found")
-            
-            if shard_worker == self.worker_address:
-                success = self.manager.current_db['db'].delete_document(request.doc_id)
-            else:
-                channel = self.manager.current_db['shards'].worker_channels[shard_worker]
+
+            # If not primary, forward request to primary
+            if not current_doc.get('_primary', False):
+                primary_worker = self.master_stub.GetDocumentPrimary(
+                    database_pb2.DocumentID(db_name=request.db_name, doc_id=request.doc_id)
+                ).worker
+                if not primary_worker:
+                    return database_pb2.OperationResponse(
+                        success=False,
+                        message="No primary worker found for document"
+                    )
+
+                channel = self.replica_channels.get(primary_worker) or grpc.insecure_channel(primary_worker)
                 stub = database_pb2_grpc.DatabaseServiceStub(channel)
-                response = stub.DeleteDocument(request)
-                return response
-            
-            if success:
+                return stub.DeleteDocument(request)
+
+            # We are the primary — delete the document
+            success = self.manager.current_db['db'].delete_document(request.doc_id)
+
+            # Also delete shard metadata
+            if success and request.doc_id in self.manager.current_db['shards'].document_shards:
                 del self.manager.current_db['shards'].document_shards[request.doc_id]
+
+            # Notify replicas to delete
+            replicas = self.master_stub.GetDocumentReplicas(
+                database_pb2.DocumentID(db_name=request.db_name, doc_id=request.doc_id)
+            ).workers
+            replica_addresses = [addr for addr in replicas if addr != self.worker_address]
+
+            delete_request = database_pb2.DeleteRequest(
+                db_name=request.db_name,
+                doc_id=request.doc_id
+            )
+
+            with futures.ThreadPoolExecutor(max_workers=5) as executor:
+                for replica_addr in replica_addresses:
+                    try:
+                        channel = self.replica_channels.get(replica_addr) or grpc.insecure_channel(replica_addr)
+                        stub = database_pb2_grpc.DatabaseServiceStub(channel)
+                        executor.submit(stub.DeleteDocument, delete_request)
+                    except Exception as e:
+                        logger.warning(f"Failed to notify replica {replica_addr} for deletion: {str(e)}")
+
             return database_pb2.OperationResponse(
                 success=success,
                 message="Document deleted" if success else "Document not found"
             )
+
         except Exception as e:
+            logger.error(f"Delete failed: {str(e)}", exc_info=True)
             context.set_code(grpc.StatusCode.INTERNAL)
             return database_pb2.OperationResponse(success=False, message=str(e))
-    
+
+
     def ClearDatabase(self, request, context):
         try:
             if not self.manager.current_db or self.manager.current_db['db'].db_file != f"{request.name}.json":
