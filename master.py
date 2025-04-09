@@ -43,6 +43,8 @@ class MasterNode:
     def assign_database(self, db_name, worker_address):
             if worker_address in self.workers:
                 self.database_assignments[db_name] = worker_address
+                self.workers[worker_address].load += 1  # Increment load for this worker
+                print(f"Assigned database {db_name} to worker {worker_address} (load: {self.workers[worker_address].load})")
                 return True
     
     def get_primary_worker(self, db_name):
@@ -122,10 +124,10 @@ class MasterService(database_pb2_grpc.DatabaseServiceServicer):
             worker_address = request.worker_address
             if worker_address in self.master.workers:
                 self.master.workers[worker_address].last_heartbeat = time.time()
-                print(f"Heartbeat received from worker {worker_address} at {datetime.fromtimestamp(request.timestamp)}")
+                #print(f"Heartbeat received from worker {worker_address} at {datetime.fromtimestamp(request.timestamp)}")
                 return database_pb2.HeartbeatResponse(acknowledged=True)
             else:
-                print(f"Heartbeat from unknown worker {worker_address}")
+                #print(f"Heartbeat from unknown worker {worker_address}")
                 return database_pb2.HeartbeatResponse(acknowledged=False)
 
     # Add this new method
@@ -160,11 +162,13 @@ class MasterService(database_pb2_grpc.DatabaseServiceServicer):
     
     def _select_worker_for_db(self, db_name):
         if not self.master.workers:
+                return None
+            # Select worker with the lowest number of primary databases (load)
+        available_workers = [w for w in self.master.workers.values() if w.health]
+        if not available_workers:
             return None
-        
-        hash_val = int(hashlib.md5(db_name.encode()).hexdigest(), 16)
-        workers = sorted(self.master.workers.values(), key=lambda w: hash(w.address))
-        return workers[hash_val % len(workers)]
+        selected_worker = min(available_workers, key=lambda w: w.load)
+        return selected_worker
     
     def GetPrimaryWorker(self, request, context):
         worker = self.master.get_primary_worker(request.name)
@@ -288,7 +292,11 @@ class MasterService(database_pb2_grpc.DatabaseServiceServicer):
             if response.success:
                 with self.master.lock:
                     if request.name in self.master.database_assignments:
+                        worker_address = self.master.database_assignments[request.name]
                         del self.master.database_assignments[request.name]
+                        if worker_address in self.master.workers:
+                            self.master.workers[worker_address].load -= 1
+                            print(f"Removed database {request.name} from worker {worker_address} (load: {self.master.workers[worker_address].load})")
             return response
         except Exception as e:
             context.set_code(grpc.StatusCode.INTERNAL)
