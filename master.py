@@ -21,6 +21,7 @@ class WorkerNode:
         self.stub = database_pb2_grpc.DatabaseServiceStub(self.channel)
         self.health = True
         self.load = 0
+        self.replica_count = 0  # Track number of replicas this worker holds
 
 class MasterNode:
     def __init__(self):
@@ -33,19 +34,15 @@ class MasterNode:
         self.health_thread.start()
     
     def add_worker(self, address):
-        with self.lock:
             if address not in self.workers:
                 self.workers[address] = WorkerNode(address)
                 print(f"Added worker {address}")
                 return True
-        return False
     
     def assign_database(self, db_name, worker_address):
-        with self.lock:
             if worker_address in self.workers:
                 self.database_assignments[db_name] = worker_address
                 return True
-        return False
     
     def get_primary_worker(self, db_name):
         return self.workers.get(self.database_assignments.get(db_name))
@@ -66,49 +63,62 @@ class MasterNode:
             
             return self.document_shards[db_name][doc_id]
 
-    def get_document_replicas(self, db_name, doc_id, replica_count=1):
-            primary = self.get_document_worker(db_name, doc_id)
-            if not primary:
-                print(f"not primary")
-                return []
+    def get_document_replicas(self, db_name, doc_id):
+        """Get list of workers that should store replicas for this document"""
+        workers = [w for w in self.workers.values() if w.health and w.address != self.get_primary_worker(db_name).address]
+        if len(workers) < 1:
+            return []
             
-            workers = sorted(self.workers.keys())
-            if len(workers) <= 1:
-                print(f"1 worker")
-                return []
+            # We want min(3, len(workers)) replicas
+        replica_count = min(3, len(workers))
             
-            primary_idx = workers.index(primary)
-            replicas = []
-            for i in range(1, replica_count + 1):
-                replica_idx = (primary_idx + i) % len(workers)
-                if replica_idx != primary_idx:
-                    replicas.append(workers[replica_idx])
+            # Sort workers by current replica count (load)
+        workers_sorted = sorted(workers, key=lambda w: w.replica_count)
             
-            return replicas
+            # Select the least loaded workers
+        selected = workers_sorted[:replica_count]
+            
+            # Update replica counts (will be decremented if replication fails)
+        for w in selected:
+            w.replica_count += 1
+            
+        return [w.address for w in selected]
     
+    def decrement_replica_count(self, worker_address):
+        """Decrement replica count when a replication fails"""
+        if worker_address in self.workers:
+            self.workers[worker_address].replica_count = max(0, self.workers[worker_address].replica_count - 1)
+
     def _health_check(self):
         while True:
             time.sleep(5)
-            with self.lock:
-                for address, worker in list(self.workers.items()):
-                    try:
-                        worker.stub.ListDatabases(database_pb2.Empty(), timeout=2)
-                        worker.health = True
-                    except:
+            for address, worker in list(self.workers.items()):
+                try:
+                    worker.stub.ListDatabases(database_pb2.Empty(), timeout=2)
+                    worker.health = True
+                except:
                         worker.health = False
+                        # Clean up database assignments
                         for db, worker_addr in list(self.database_assignments.items()):
                             if worker_addr == address:
                                 del self.database_assignments[db]
                         del self.workers[address]
                         print(f"Removed failed worker {address}")
 
+
 class MasterService(database_pb2_grpc.DatabaseServiceServicer):
     def __init__(self, master_node):
         self.master = master_node
 
+    # Add this new method
+    def RegisterWorker(self, request, context):
+        if self.master.add_worker(request.worker):
+            return database_pb2.OperationResponse(success=True, message="Worker registered successfully")
+        else:
+            return database_pb2.OperationResponse(success=False, message="Worker already registered")
+
     def ListWorkers(self, request, context):
-        with self.master.lock:
-            workers = list(self.master.workers.keys())
+        workers = list(self.master.workers.keys())
         return database_pb2.WorkerList(workers=workers)
     
     def GetDocumentReplicas(self, request, context):
@@ -144,6 +154,99 @@ class MasterService(database_pb2_grpc.DatabaseServiceServicer):
             context.set_code(grpc.StatusCode.NOT_FOUND)
             return database_pb2.Worker()
         return database_pb2.Worker(worker=worker.address)
+    
+    def GetDocumentPrimary(self, request, context):
+        """Return the primary worker for a specific document"""
+        doc_id = request.doc_id
+        worker_addr = self.master.get_document_worker(request.db_name, doc_id)
+        workers = [worker_addr] if worker_addr else []
+
+        # Check each worker to find which one has the primary
+        for worker in workers:
+            try:
+                channel = grpc.insecure_channel(worker)
+                stub = database_pb2_grpc.DatabaseServiceStub(channel)
+                doc_response = stub.ReadDocument(request)
+                if doc_response.document:
+                    doc = json.loads(doc_response.document)
+                    if doc.get('_primary', False):
+                        return database_pb2.Worker(worker=worker)
+            except:
+                continue
+        
+        # If no primary found, select one
+        if workers:
+            return self.SetDocumentPrimary(
+                database_pb2.SetPrimaryRequest(
+                    db_name=request.db_name,
+                    doc_id=doc_id,
+                    worker_address=workers[0]
+                ),
+                context
+            )
+        return database_pb2.Worker()
+
+    def SetDocumentPrimary(self, request, context):
+        """Designate a specific worker as primary for a document"""
+        try:
+            # Contact the new primary worker
+            channel = grpc.insecure_channel(request.worker_address)
+            stub = database_pb2_grpc.DatabaseServiceStub(channel)
+            
+            # Get current document
+            doc_response = stub.ReadDocument(database_pb2.DocumentID(
+                db_name=request.db_name,
+                doc_id=request.doc_id
+            ))
+            
+            if not doc_response.document:
+                return database_pb2.OperationResponse(
+                    success=False,
+                    message="Document not found on target worker"
+                )
+            
+            # Update document to mark as primary
+            doc = json.loads(doc_response.document)
+            doc['_primary'] = True
+            doc['_updated_at'] = datetime.now().isoformat()
+            
+            # Save back to worker
+            stub.ReplicateDocument(database_pb2.ReplicateRequest(
+                db_name=request.db_name,
+                doc_id=request.doc_id,
+                document=json.dumps(doc)
+            ))
+            
+            # Get all replicas
+            replicas = self.GetDocumentReplicas(database_pb2.DocumentID(
+                db_name=request.db_name,
+                doc_id=request.doc_id
+            )).workers
+            
+            # Update all replicas to mark them as non-primary
+            for replica in replicas:
+                if replica != request.worker_address:
+                    try:
+                        channel = grpc.insecure_channel(replica)
+                        stub = database_pb2_grpc.DatabaseServiceStub(channel)
+                        doc['_primary'] = False
+                        stub.ReplicateDocument(database_pb2.ReplicateRequest(
+                            db_name=request.db_name,
+                            doc_id=request.doc_id,
+                            document=json.dumps(doc)
+                        ))
+                    except:
+                        continue
+            
+            return database_pb2.OperationResponse(
+                success=True,
+                message=f"Worker {request.worker_address} set as primary for document {request.doc_id}"
+            )
+        except Exception as e:
+            return database_pb2.OperationResponse(
+                success=False,
+                message=str(e)
+            )
 
     def UseDatabase(self, request, context):
         worker = self.master.get_primary_worker(request.name)
@@ -284,19 +387,22 @@ class MasterService(database_pb2_grpc.DatabaseServiceServicer):
     def UpdateDocument(self, request, context):
         logger.info(f"UpdateDocument: db_name={request.db_name}, doc_id={request.doc_id}")
         
-        # Find which worker has this document
-        worker_addr = self.master.get_document_worker(request.db_name, request.doc_id)
+        # Get primary worker for this database
+        worker_addr = self.master.get_primary_worker(request.db_name)
+        #worker_addr = self.master.get_document_worker(request.db_name, request.doc_id)
+
         if not worker_addr:
             context.set_code(grpc.StatusCode.NOT_FOUND)
             return database_pb2.OperationResponse(success=False, message="Document not found")
         
-        worker = self.master.workers.get(worker_addr)
+        #worker = self.master.workers.get(worker_addr)
+        worker = self.master.get_primary_worker(request.db_name)
         if not worker:
             context.set_code(grpc.StatusCode.NOT_FOUND)
             return database_pb2.OperationResponse(success=False, message="Worker not found")
         
         try:
-            print(f"update request sent to wroekr : " ,worker)
+            print(f"update request sent to primary worker : " , {worker_addr.address})
             return worker.stub.UpdateDocument(request)
         except Exception as e:
             logger.error(f"Error updating document: {str(e)}")
@@ -319,8 +425,8 @@ class MasterService(database_pb2_grpc.DatabaseServiceServicer):
 
 def serve_master():
     master_node = MasterNode()
-    master_node.add_worker("localhost:50051")
-    master_node.add_worker("localhost:50052")
+    # master_node.add_worker("localhost:50051")
+    # master_node.add_worker("localhost:50052")
     
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
     database_pb2_grpc.add_DatabaseServiceServicer_to_server(
