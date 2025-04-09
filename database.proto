@@ -17,7 +17,7 @@ service DatabaseService {
     rpc ReadAllDocuments (DatabaseName) returns (DocumentList);
     rpc QueryDocuments (QueryRequest) returns (DocumentList);
     rpc UpdateDocument (UpdateRequest) returns (OperationResponse);
-    rpc DeleteDocument (DocumentID) returns (OperationResponse);
+    rpc DeleteDocument (DeleteRequest) returns (OperationResponse);
     rpc ClearDatabase (DatabaseName) returns (OperationResponse);
 
     rpc GetLoadInfo (Empty) returns (LoadInfo);
@@ -99,6 +99,11 @@ message UpdateRequest {
     string doc_id = 2;
     string updates = 3;  // JSON string
     bool create_if_missing = 4;
+}
+
+message DeleteRequest {
+    string db_name = 1;
+    string doc_id = 2;
 }
 
 message OperationResponse {
