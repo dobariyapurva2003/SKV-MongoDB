@@ -32,7 +32,7 @@ class DatabaseClient:
             return self.read_all_documents()
         elif cmd == "update" and len(parts) >= 3:
             return self.update_document(parts[1], " ".join(parts[2:]))
-        elif cmd == "delete" and len(parts) == 2:
+        elif cmd == "delete_doc" and len(parts) == 2:
             return self.delete_document(parts[1])
         elif cmd == "clear":
             return self.clear_database()
