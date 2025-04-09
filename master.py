@@ -22,6 +22,7 @@ class WorkerNode:
         self.health = True
         self.load = 0
         self.replica_count = 0  # Track number of replicas this worker holds
+        self.last_heartbeat = time.time()  # Track last heartbeat time
 
 class MasterNode:
     def __init__(self):
@@ -92,23 +93,40 @@ class MasterNode:
     def _health_check(self):
         while True:
             time.sleep(5)
-            for address, worker in list(self.workers.items()):
-                try:
-                    worker.stub.ListDatabases(database_pb2.Empty(), timeout=2)
-                    worker.health = True
-                except:
+            with self.lock:
+                current_time = time.time()
+                for address, worker in list(self.workers.items()):
+                    # Check if worker missed heartbeats (e.g., 15 seconds threshold)
+                    if current_time - worker.last_heartbeat > 15:
                         worker.health = False
-                        # Clean up database assignments
                         for db, worker_addr in list(self.database_assignments.items()):
                             if worker_addr == address:
                                 del self.database_assignments[db]
                         del self.workers[address]
-                        print(f"Removed failed worker {address}")
+                        print(f"Removed failed worker {address} due to missed heartbeats")
+                    else:
+                        try:
+                            worker.stub.ListDatabases(database_pb2.Empty(), timeout=2)
+                            worker.health = True
+                        except:
+                            worker.health = False
+                            print(f"Worker {address} unresponsive but still receiving heartbeats")
 
 
 class MasterService(database_pb2_grpc.DatabaseServiceServicer):
     def __init__(self, master_node):
         self.master = master_node
+
+    def Heartbeat(self, request, context):
+        with self.master.lock:
+            worker_address = request.worker_address
+            if worker_address in self.master.workers:
+                self.master.workers[worker_address].last_heartbeat = time.time()
+                print(f"Heartbeat received from worker {worker_address} at {datetime.fromtimestamp(request.timestamp)}")
+                return database_pb2.HeartbeatResponse(acknowledged=True)
+            else:
+                print(f"Heartbeat from unknown worker {worker_address}")
+                return database_pb2.HeartbeatResponse(acknowledged=False)
 
     # Add this new method
     def RegisterWorker(self, request, context):
