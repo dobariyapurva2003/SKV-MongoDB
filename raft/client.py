@@ -157,30 +157,23 @@ class DatabaseClient:
     
 
     def list_databases(self) -> str:
-        response = self.master_stub.ListDatabases(database_pb2.Empty())
+        master_addr = self.get_leader()
+        stub = database_pb2_grpc.DatabaseServiceStub(grpc.insecure_channel(master_addr))
+        response = stub.ListDatabases(database_pb2.Empty())
         return "Databases:\n" + "\n".join(response.names) if response.names else "No databases"
 
     def list_workers(self) -> str:
-        response = self.master_stub.ListWorkers(database_pb2.Empty())
+        master_addr = self.get_leader()
+        stub = database_pb2_grpc.DatabaseServiceStub(grpc.insecure_channel(master_addr))
+        response = stub.ListWorkers(database_pb2.Empty())
         return "Workers:\n" + "\n".join(response.workers) if response.workers else "No workers available"
 
     def delete_database(self, db_name: str) -> str:
         # Get primary worker first
-        worker = self.master_stub.GetPrimaryWorker(
-            database_pb2.DatabaseName(name=db_name))
-        
-        if not worker.address:
-            return f"Database '{db_name}' not found or no primary worker"
-        
-        worker_stub = self.get_worker_stub(worker.address)
-        response = worker_stub.DeleteDatabase(
-            database_pb2.DatabaseName(name=db_name))
-        
-        if response.success:
-            # Only unassign if deletion was successful
-            self.master_stub.UnassignDatabase(
-                database_pb2.DatabaseName(name=db_name))
-        
+        master_addr = self.get_leader()
+        stub = database_pb2_grpc.DatabaseServiceStub(grpc.insecure_channel(master_addr))
+
+        response = stub.DeleteDatabase(database_pb2.DatabaseName(name=db_name))        
         return response.message
 
     def create_document(self, doc_id: str, document_json: str) -> str:
@@ -392,12 +385,7 @@ class DatabaseClient:
             print(f"Master address: {master_addr}")
             stub = database_pb2_grpc.DatabaseServiceStub(grpc.insecure_channel(master_addr))
 
-            # primary = stub.GetDocumentPrimary(
-            #     database_pb2.DocumentID(
-            #         db_name=self.current_db,
-            #         doc_id=doc_id
-            #     )
-            # )
+            
             # Query the master for the primary worker for the document
             primary = stub.GetPrimaryWorker(
                 database_pb2.DocumentID(
@@ -438,14 +426,19 @@ class DatabaseClient:
         if not self.current_db:
             return "No database selected. Use 'use <db_name>' first."
         
+        master_addr = self.get_leader()
+        print(f"Master address: {master_addr}")
+        stub = database_pb2_grpc.DatabaseServiceStub(grpc.insecure_channel(master_addr))
         # Get primary worker
-        worker = self.master_stub.GetPrimaryWorker(
+        worker = stub.GetPrimaryWorker(
             database_pb2.DatabaseName(name=self.current_db))
         
-        if not worker.address:
+        print(f"worker : " , worker.worker)
+        
+        if not worker.worker:
             return "No primary worker available"
         
-        worker_stub = self.get_worker_stub(worker.address)
+        worker_stub = self.get_worker_stub(worker.worker)
         response = worker_stub.ClearDatabase(
             database_pb2.DatabaseName(name=self.current_db))
         
