@@ -397,7 +397,7 @@ class DatabaseService(database_pb2_grpc.DatabaseServiceServicer):
                     os.remove(f"{request.name}.json")
                 del self.manager.databases[request.name]
                 if (self.manager.current_db and 
-                    self.manager.current_db['db'].db_file == f"{request.name}.json"):
+                    self.manager.current_db.db_file == f"{request.name}.json"):
                     self.manager.current_db = None
                 return database_pb2.OperationResponse(
                     success=True,
@@ -449,7 +449,8 @@ class DatabaseService(database_pb2_grpc.DatabaseServiceServicer):
                 try:
                     if replica_addr not in self.replica_channels:
                         self.replica_channels[replica_addr] = grpc.insecure_channel(replica_addr)
-                    
+
+                    print(f"secondary worker : " , self.replica_channels[replica_addr])
                     stub = database_pb2_grpc.DatabaseServiceStub(self.replica_channels[replica_addr])
                     response = stub.ReplicateDocument(
                         database_pb2.ReplicateRequest(
@@ -526,14 +527,14 @@ class DatabaseService(database_pb2_grpc.DatabaseServiceServicer):
     def ReplicateDocument(self, request, context):
         """Handle document replication from primary"""
         try:
-            if not self.manager.current_db or self.manager.current_db['db'].db_file != f"{request.db_name}.json":
+            if not self.manager.current_db or self.manager.current_db.db_file != f"{request.db_name}.json":
                 self.manager.use_database(request.db_name)
             
             doc_data = json.loads(request.document)
             doc_id = request.doc_id
             
-            if doc_id in self.manager.current_db['db'].data:
-                current_doc = self.manager.current_db['db'].data[doc_id]
+            if doc_id in self.manager.current_db.data:
+                current_doc = self.manager.current_db.data[doc_id]
                 current_doc.update(doc_data)
                 if '_primary' in doc_data:
                     current_doc['_primary'] = doc_data['_primary']
@@ -541,7 +542,7 @@ class DatabaseService(database_pb2_grpc.DatabaseServiceServicer):
             else:
                 doc_data['_created_at'] = datetime.now().isoformat()
                 doc_data['_updated_at'] = datetime.now().isoformat()
-                self.manager.current_db['db'].create_document(doc_data, doc_id)
+                self.manager.current_db.create_document(doc_data, doc_id)
             
             print(f"document replicated on this worker")
             return database_pb2.OperationResponse(success=True)
@@ -850,10 +851,9 @@ class DatabaseService(database_pb2_grpc.DatabaseServiceServicer):
 
     def ClearDatabase(self, request, context):
         try:
-            if not self.manager.current_db or self.manager.current_db['db'].db_file != f"{request.name}.json":
+            if not self.manager.current_db or self.manager.current_db.db_file != f"{request.name}.json":
                 self.manager.use_database(request.name)
-            self.manager.current_db['db'].clear_database()
-            self.manager.current_db['shards'] = ShardMetadata()
+            self.manager.current_db.clear_database()
             return database_pb2.OperationResponse(
                 success=True,
                 message="Database cleared"
@@ -909,3 +909,4 @@ if __name__ == '__main__':
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 50051
     master_addrs = sys.argv[2:] if len(sys.argv) > 2 else ["localhost:50050"]
     serve_worker(port, master_addrs)
+ 
