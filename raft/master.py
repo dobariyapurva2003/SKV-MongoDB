@@ -978,6 +978,17 @@ class MasterService(database_pb2_grpc.DatabaseServiceServicer):
     def is_leader(self):
         return self.master.raft_node.state.role == RaftRole.Leader
     
+
+    def DecrementReplicaCount(self, request, context):
+        # Your logic here
+        addr = request.worker_addr
+        if addr in self.master.workers:
+                self.master.workers[addr].replica_count -= 1
+                logger.info(f"Decremented replica count for {addr}")
+        else:
+                logger.warning(f"Attempted to decrement replica count for unknown worker: {addr}")
+        return database_pb2.DecrementResponse(success=True)
+    
     def Heartbeat(self, request, context):
         try:
             if not self.is_leader():
@@ -1236,14 +1247,14 @@ class MasterService(database_pb2_grpc.DatabaseServiceServicer):
         """Handle document replication from primary"""
         try:
             # Ensure we're using the correct database
-            if not self.manager.current_db or self.manager.current_db['db'].db_file != f"{request.db_name}.json":
+            if not self.manager.current_db or self.manager.current_db.db_file != f"{request.db_name}.json":
                 self.manager.use_database(request.db_name)
             
             doc_data = json.loads(request.document)
             doc_id = request.doc_id
             
             # Check if document exists
-            existing_doc = self.manager.current_db['db'].read_document(doc_id)
+            existing_doc = self.manager.current_db.read_document(doc_id)
             
             if existing_doc:
                 # Merge updates
@@ -1251,12 +1262,12 @@ class MasterService(database_pb2_grpc.DatabaseServiceServicer):
                 existing_doc['_updated_at'] = datetime.now().isoformat()
                 if '_version' in doc_data:
                     existing_doc['_version'] = doc_data['_version']
-                self.manager.current_db['db']._save()
+                self.manager.current_db._save()
             else:
                 # Create new document if it doesn't exist
                 doc_data['_created_at'] = datetime.now().isoformat()
                 doc_data['_updated_at'] = datetime.now().isoformat()
-                self.manager.current_db['db'].create_document(doc_data, doc_id)
+                self.manager.current_db.create_document(doc_data, doc_id)
             
             return database_pb2.OperationResponse(success=True)
         except Exception as e:
