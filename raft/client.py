@@ -4,7 +4,7 @@ import database_pb2
 import database_pb2_grpc
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
-
+ 
 class DatabaseClient:
     def __init__(self, master_address="localhost:50050"):
         self.master_channel = grpc.insecure_channel(master_address)
@@ -12,6 +12,17 @@ class DatabaseClient:
         self.current_db: Optional[str] = None
         self.worker_stub_cache = {}  # Cache for worker stubs
         self.executor = ThreadPoolExecutor(max_workers=10)
+
+    def get_leader(self) -> str:
+        try:
+            response = self.master_stub.GetLeader(database_pb2.Empty())
+            if response.leader_address:
+                return response.leader_address
+            else:
+                return "No leader currently elected."
+        except grpc.RpcError as e:
+            return f"Failed to get leader info: {e.details()}"
+
 
     def get_worker_address(self, worker_msg):
         """Extract worker address from different possible formats"""
@@ -93,43 +104,58 @@ class DatabaseClient:
             return f"Error: {str(e)}"
 
     def create_database(self, db_name: str) -> str:
-        response = self.master_stub.CreateDatabase(
+        master_addr = self.get_leader()
+        stub = database_pb2_grpc.DatabaseServiceStub(grpc.insecure_channel(master_addr))
+        response = stub.CreateDatabase(
             database_pb2.DatabaseName(name=db_name)
         )
         return response.message
 
     def use_database(self, db_name: str) -> str:
         try:
-            # Verify database exists
-            db_list = self.master_stub.ListDatabases(database_pb2.Empty())
+            master_addr = self.get_leader()
+            stub = database_pb2_grpc.DatabaseServiceStub(grpc.insecure_channel(master_addr))
+            # First verify with master that database exists
+            db_list = stub.ListDatabases(database_pb2.Empty())
             if db_name not in db_list.names:
+                print(f"database not found in list")
                 return f"Database '{db_name}' not found"
 
-            # Get primary worker
-            worker = self.master_stub.GetPrimaryWorker(
+            # Get primary worker from master
+            worker = stub.GetPrimaryWorker(
                 database_pb2.DatabaseName(name=db_name))
             
             if not worker or not worker.worker:
                 return "No primary worker available"
 
-            # Connect to worker
-            worker_stub = self.get_worker_stub(worker)
-            response = worker_stub.UseDatabase(
+            # IMPORTANT: Tell the MASTER to use the database, not the worker directly
+            # This ensures proper replication and state tracking
+            master_response = stub.UseDatabase(
                 database_pb2.DatabaseName(name=db_name))
             
-            if response.success:
+            if not master_response.success:
+                return f"Master failed to use database: {master_response.message}"
+            
+            
+
+            # Now use it on the worker too
+            worker_stub = self.get_worker_stub(worker)
+            worker_response = worker_stub.UseDatabase(
+                database_pb2.DatabaseName(name=db_name))
+            
+            if worker_response.success:
                 self.current_db = db_name
                 self.current_worker = worker.worker
                 return f"Using database '{db_name}' on worker {worker.worker}"
-            return response.message
+            
+            return f"Worker failed: {worker_response.message}"
         
         except grpc.RpcError as e:
             return f"RPC Error ({e.code().name}): {e.details()}"
-        except ValueError as e:
-            return f"Address Error: {str(e)}"
         except Exception as e:
-            return f"Unexpected Error: {str(e)}"
+            return f"Error using database: {str(e)}"
     
+
     def list_databases(self) -> str:
         response = self.master_stub.ListDatabases(database_pb2.Empty())
         return "Databases:\n" + "\n".join(response.names) if response.names else "No databases"
@@ -164,10 +190,11 @@ class DatabaseClient:
         try:
             # Validate JSON
             doc_data = json.loads(document_json)
-            
+            master_addr = self.get_leader()
+            stub = database_pb2_grpc.DatabaseServiceStub(grpc.insecure_channel(master_addr))
             if not self.current_worker:
                 # Fallback to getting primary worker
-                worker = self.master_stub.GetPrimaryWorker(
+                worker = stub.GetPrimaryWorker(
                     database_pb2.DatabaseName(name=self.current_db))
                 if not worker or not worker.worker:
                     return "No worker available for this database"
@@ -243,13 +270,15 @@ class DatabaseClient:
         
         try:
             # Get primary worker
-            worker = self.master_stub.GetPrimaryWorker(
+            master_addr = self.get_leader()
+            stub = database_pb2_grpc.DatabaseServiceStub(grpc.insecure_channel(master_addr))
+            worker = stub.GetPrimaryWorker(
                 database_pb2.DatabaseName(name=self.current_db))
             
             if not worker.worker:  # Changed from worker.address to worker.worker
                 return "No primary worker available"
             
-            worker_stub = self.get_worker_stub(worker)
+            worker_stub = self.get_worker_stub(worker.worker)
             response = worker_stub.ReadAllDocuments(
                 database_pb2.DatabaseName(name=self.current_db))
             
@@ -305,13 +334,25 @@ class DatabaseClient:
     
     def update_document(self, doc_id: str, updates_json: str) -> str:
         if not self.current_db:
+            print("No database selected. Use 'use <db_name>' first.")
             return "No database selected. Use 'use <db_name>' first."
         
         try:
+            print(f"Preparing to update document {doc_id} with {updates_json}")
             updates = json.loads(updates_json)
-            
-            # Get document primary
-            primary = self.master_stub.GetDocumentPrimary(
+            master_addr = self.get_leader()
+            print(f"Master address: {master_addr}")
+            stub = database_pb2_grpc.DatabaseServiceStub(grpc.insecure_channel(master_addr))
+            # # Get document primary
+            # primary = stub.GetDocumentPrimary(
+            #     database_pb2.DocumentID(
+            #         db_name=self.current_db,
+            #         doc_id=doc_id
+            #     )
+            # )
+
+            # Query the master for the primary worker for the document
+            primary = stub.GetPrimaryWorker(
                 database_pb2.DocumentID(
                     db_name=self.current_db,
                     doc_id=doc_id
@@ -319,16 +360,19 @@ class DatabaseClient:
             )
             
             if not primary.worker:
+                print(f"Document not found or no primary assigned")
                 return "Document not found or no primary assigned"
             
             try:
-                worker_stub = self.get_worker_stub(primary)
+                worker_stub = self.get_worker_stub(primary.worker)
+                print(f"Calling UpdateDocument on primary worker: {primary.worker}")
                 response = worker_stub.UpdateDocument(
                     database_pb2.UpdateRequest(
                         db_name=self.current_db,
                         doc_id=doc_id,
                         updates=json.dumps(updates)
                 ))
+                print(f"Update response: {response.message}")
                 return response.message
             except grpc.RpcError as e:
                 return f"Failed to update document: {e.details()}"
@@ -344,7 +388,18 @@ class DatabaseClient:
         
         try:
             # Get document primary
-            primary = self.master_stub.GetDocumentPrimary(
+            master_addr = self.get_leader()
+            print(f"Master address: {master_addr}")
+            stub = database_pb2_grpc.DatabaseServiceStub(grpc.insecure_channel(master_addr))
+
+            # primary = stub.GetDocumentPrimary(
+            #     database_pb2.DocumentID(
+            #         db_name=self.current_db,
+            #         doc_id=doc_id
+            #     )
+            # )
+            # Query the master for the primary worker for the document
+            primary = stub.GetPrimaryWorker(
                 database_pb2.DocumentID(
                     db_name=self.current_db,
                     doc_id=doc_id
