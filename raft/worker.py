@@ -11,7 +11,7 @@ import database_pb2
 import database_pb2_grpc
 import logging
 import time
-
+ 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("Worker")
 
@@ -37,6 +37,7 @@ class SimpleJSONDB:
 
     def read_document(self, doc_id: str) -> Optional[Dict]:
         self._load()  # Reload from disk before reading
+        print(f"getting document from worker : ", self.data.get(doc_id))
         return self.data.get(doc_id)
 
     def read_all_documents(self) -> List[Dict]:
@@ -119,6 +120,7 @@ class DatabaseManager:
         return self.databases[db_name]['db']
     
     def use_database(self, db_name: str) -> SimpleJSONDB:
+        
         if db_name not in self.databases:
             if os.path.exists(f"{db_name}.json"):
                 self.databases[db_name] = {
@@ -128,10 +130,11 @@ class DatabaseManager:
             else:
                 raise ValueError(f"Database '{db_name}' doesn't exist")
         self.current_db = self.databases[db_name]
+        print(f"current db : " , self.current_db['db'])
         return self.current_db['db']
 
 class DatabaseService(database_pb2_grpc.DatabaseServiceServicer):
-    def __init__(self, worker_address: str, master_addresses: List[str]):
+    def __init__(self, worker_address: str, master_addresses: str):
         self.manager = DatabaseManager()
         self.worker_address = worker_address
         self.master_addresses = master_addresses
@@ -140,6 +143,7 @@ class DatabaseService(database_pb2_grpc.DatabaseServiceServicer):
         self.master_channel: Optional[grpc.Channel] = None
         self.master_stub: Optional[database_pb2_grpc.DatabaseServiceStub] = None
         self.replica_channels: Dict[str, grpc.Channel] = {}  # Cache for replica channels
+        self.shard_metadata = ShardMetadata()  # Initialize shard metadata
         
         # Initialize master connection
         self._discover_master_leader()
@@ -164,18 +168,24 @@ class DatabaseService(database_pb2_grpc.DatabaseServiceServicer):
                         continue
                 
                 logger.info(f"Attempting to register with master at {self.current_leader}")
-                response = self.master_stub.AddWorker(
+                channel = grpc.insecure_channel(self.current_leader)
+                stub = database_pb2_grpc.DatabaseServiceStub(channel)
+
+                response = stub.AddWorker(
                     database_pb2.Worker(worker=self.worker_address),
                     timeout=3
                 )
                 
                 if response.success:
                     logger.info(f"Successfully registered worker {self.worker_address} with master")
+                    self.master_channel = channel
+                    self.master_stub = stub 
                     return True
                 else:
                     logger.warning(f"Registration attempt {attempt+1} failed: {response.message}")
             except Exception as e:
                 logger.warning(f"Registration attempt {attempt+1} failed with error: {str(e)}")
+                self.current_leader = None  # Force rediscovery
             
             time.sleep(1)  # Wait before retrying
         
@@ -188,8 +198,7 @@ class DatabaseService(database_pb2_grpc.DatabaseServiceServicer):
             try:
                 channel = grpc.insecure_channel(master_addr)
                 stub = database_pb2_grpc.DatabaseServiceStub(channel)
-                response = stub.GetLeader(database_pb2.Empty(), timeout=1)
-                
+                response = stub.GetLeader(database_pb2.Empty())
                 if response.leader_address:
                     self.current_leader = response.leader_address
                     self.master_channel = channel
@@ -238,7 +247,7 @@ class DatabaseService(database_pb2_grpc.DatabaseServiceServicer):
                 logger.warning(f"Could not discover workers from master: {str(e)}")
                 time.sleep(1)
         else:
-            self.known_workers = ["localhost:50051", "localhost:50052"]  # Fallback
+            #self.known_workers = ["localhost:50051", "localhost:50052"]  # Fallback
             logger.info(f"Fallback to default workers: {self.known_workers}")
 
     def _send_heartbeats(self) -> None:
@@ -288,9 +297,45 @@ class DatabaseService(database_pb2_grpc.DatabaseServiceServicer):
 
     def CreateDatabase(self, request, context):
         try:
-            self.manager.create_database(request.name)
+            db_file = f"{request.name}.json"
+            
+            # Double-check with file system
+            if os.path.exists(db_file):
+                try:
+                    with open(db_file, 'r') as f:
+                        json.load(f)  # Validate JSON
+                    return database_pb2.OperationResponse(
+                        success=True,
+                        message=f"Database '{request.name}' already exists"
+                    )
+                except json.JSONDecodeError:
+                    # Corrupted file - overwrite it
+                    pass
+
+            # Create with file lock
+            with open(db_file, 'w') as f:
+                json.dump({}, f)
+                f.flush()
+                os.fsync(f.fileno())  # Force write to disk
+
+            # Ensure immediate visibility in manager
+            if request.name not in self.manager.databases:
+                self.manager.databases[request.name] = {
+                    'db': SimpleJSONDB(db_file),
+                    'shards': ShardMetadata()
+                }
+                self.manager.current_db = self.manager.databases[request.name]
+                print(f"database at worker side stored : " , self.manager.current_db)
+
+            # Verify creation
+            if not os.path.exists(db_file):
+                return database_pb2.OperationResponse(
+                    success=False,
+                    message="Failed to create database file"
+                )
+
             return database_pb2.OperationResponse(
-                success=True, 
+                success=True,
                 message=f"Database '{request.name}' created"
             )
         except Exception as e:
@@ -298,10 +343,38 @@ class DatabaseService(database_pb2_grpc.DatabaseServiceServicer):
                 success=False,
                 message=str(e)
             )
-    
+        
     def UseDatabase(self, request, context):
         try:
-            self.manager.use_database(request.name)
+            db_file = f"{request.name}.json"
+            print(f"Looking for database file at: {os.path.abspath(db_file)}")  # Add this
+            print(f"File exists: {os.path.exists(db_file)}")  # Add this
+
+            # Verify absolute path
+            abs_path = os.path.abspath(db_file)
+            print(f"Checking database at: {abs_path}")
+            # Verify database exists and is valid
+            if not os.path.exists(db_file):
+                print(f"Database file '{request.name}.json' doesn't exist")
+                return database_pb2.OperationResponse(
+                    success=False,
+                    message=f"Database file '{request.name}.json' doesn't exist"
+                )
+                
+            try:
+                with open(db_file, 'r') as f:
+                    json.load(f)  # Verify valid JSON
+            except Exception as e:
+                print(f"Database file is corrupted: {str(e)}")
+                return database_pb2.OperationResponse(
+                    success=False,
+                    message=f"Database file is corrupted: {str(e)}"
+                )
+            
+            # Now use it
+            self.manager.current_db =self.manager.use_database(request.name)
+            print(f"database created by worker")
+
             return database_pb2.OperationResponse(
                 success=True,
                 message=f"Using database '{request.name}'"
@@ -311,6 +384,7 @@ class DatabaseService(database_pb2_grpc.DatabaseServiceServicer):
                 success=False,
                 message=str(e)
             )
+    
     
     def ListDatabases(self, request, context):
         dbs = list(self.manager.databases.keys())
@@ -343,7 +417,8 @@ class DatabaseService(database_pb2_grpc.DatabaseServiceServicer):
         try:
             logger.info(f"CreateDocument received for db={request.db_name}, doc_id={request.doc_id}")
             
-            if not self.manager.current_db or self.manager.current_db['db'].db_file != f"{request.db_name}.json":
+            #if not self.manager.current_db or self.manager.current_db['db'].db_file != f"{request.db_name}.json":
+            if not self.manager.current_db or self.manager.current_db.db_file != f"{request.db_name}.json":
                 self.manager.use_database(request.db_name)
             
             doc_id = request.doc_id or str(uuid.uuid4())
@@ -357,7 +432,10 @@ class DatabaseService(database_pb2_grpc.DatabaseServiceServicer):
             }
             
             # Store document locally
-            self.manager.current_db['db'].create_document(doc_data, doc_id)
+            # self.manager.current_db['db'].create_document(doc_data, doc_id)
+            # Correct:
+            self.manager.current_db.create_document(doc_data, doc_id)
+
             
             # Get replica workers from master
             replicas_response = self.master_stub.GetDocumentReplicas(
@@ -479,12 +557,12 @@ class DatabaseService(database_pb2_grpc.DatabaseServiceServicer):
             logger.info(f"ReadDocument: db={request.db_name} doc_id={request.doc_id}")
             
             # Ensure correct database is loaded
-            if not self.manager.current_db or self.manager.current_db['db'].db_file != f"{request.db_name}.json":
+            if not self.manager.current_db or self.manager.current_db.db_file != f"{request.db_name}.json":
                 self.manager.use_database(request.db_name)
                 logger.info(f"Loaded database {request.db_name}")
             
             # Try local read first
-            doc = self.manager.current_db['db'].read_document(request.doc_id)
+            doc = self.manager.current_db.read_document(request.doc_id)
             if doc:
                 logger.info(f"Found document locally: {doc}")
                 return database_pb2.DocumentResponse(document=json.dumps(doc))
@@ -521,9 +599,9 @@ class DatabaseService(database_pb2_grpc.DatabaseServiceServicer):
 
     def ReadAllDocuments(self, request, context):
         try:
-            if not self.manager.current_db or self.manager.current_db['db'].db_file != f"{request.name}.json":
+            if not self.manager.current_db or self.manager.current_db.db_file != f"{request.name}.json":
                 self.manager.use_database(request.name)
-            docs = self.manager.current_db['db'].read_all_documents()
+            docs = self.manager.current_db.read_all_documents()
             return database_pb2.DocumentList(documents=[json.dumps(doc) for doc in docs])
         except Exception as e:
             context.set_code(grpc.StatusCode.INTERNAL)
@@ -547,14 +625,22 @@ class DatabaseService(database_pb2_grpc.DatabaseServiceServicer):
     def UpdateDocument(self, request, context):
         try:
             logger.info(f"UpdateDocument: db={request.db_name}, doc_id={request.doc_id}")
-            
+            logger.info(f"[WORKER] Update request for doc {request.doc_id} on DB {request.db_name}")
+            print("Available doc keys:", list(self.manager.current_db.data.keys()))
+
             # Step 1: Ensure correct database
-            if not self.manager.current_db or self.manager.current_db['db'].db_file != f"{request.db_name}.json":
+            if not self.manager.current_db or self.manager.current_db.db_file != f"{request.db_name}.json":
                 logger.info(f"Switching to database {request.db_name}")
                 self.manager.use_database(request.db_name)
+
+            
             
             # Step 2: Retrieve document
-            current_doc = self.manager.current_db['db'].read_document(request.doc_id)
+            current_doc = self.manager.current_db.read_document(request.doc_id)
+
+            if current_doc is None:
+                logger.warning(f"[WORKER] Document {request.doc_id} not found in worker memory.")
+
             if not current_doc:
                 logger.info(f"Document {request.doc_id} not found in {request.db_name}")
                 context.set_code(grpc.StatusCode.NOT_FOUND)
@@ -577,8 +663,15 @@ class DatabaseService(database_pb2_grpc.DatabaseServiceServicer):
                         message="No primary worker found for document"
                     )
                 logger.info(f"Forwarding update to primary {primary_worker.worker}")
-                channel = self.replica_channels.get(primary_worker.worker) or grpc.insecure_channel(primary_worker.worker)
-                stub = database_pb2_grpc.DatabaseServiceStub(channel)
+                # channel = self.replica_channels.get(primary_worker.worker) or grpc.insecure_channel(primary_worker.worker)
+                # stub = database_pb2_grpc.DatabaseServiceStub(channel)
+
+                primary_addr = primary_worker.worker
+                # Forward request to primary
+                if primary_addr not in self.replica_channels:
+                    self.replica_channels[primary_addr] = grpc.insecure_channel(primary_addr)
+                stub = database_pb2_grpc.DatabaseServiceStub(self.replica_channels[primary_addr])
+
                 return stub.UpdateDocument(request)
             
             # Step 4: Perform local update (primary)
@@ -586,7 +679,7 @@ class DatabaseService(database_pb2_grpc.DatabaseServiceServicer):
             current_doc.update(updates)
             current_doc['_updated_at'] = datetime.now().isoformat()
             current_doc['_version'] = current_doc.get('_version', 0) + 1
-            self.manager.current_db['db']._save()
+            self.manager.current_db._save()
             logger.info(f"Document {request.doc_id} updated locally on primary {self.worker_address}: {current_doc}")
             
             # Step 5: Replicate to secondaries
@@ -657,16 +750,16 @@ class DatabaseService(database_pb2_grpc.DatabaseServiceServicer):
         except Exception as e:
             logger.error(f"Replication failed: {str(e)}", exc_info=True)
             return f"Updated primary, replication failed: {str(e)}"
-        
+
 
     def DeleteDocument(self, request, context):
         try:
             logger.info(f"DeleteDocument: db={request.db_name}, doc_id={request.doc_id}")
 
-            if not self.manager.current_db or self.manager.current_db['db'].db_file != f"{request.db_name}.json":
+            if not self.manager.current_db or self.manager.current_db.db_file != f"{request.db_name}.json":
                 self.manager.use_database(request.db_name)
 
-            current_doc = self.manager.current_db['db'].read_document(request.doc_id)
+            current_doc = self.manager.current_db.read_document(request.doc_id)
             if not current_doc:
                 context.set_code(grpc.StatusCode.NOT_FOUND)
                 return database_pb2.OperationResponse(
@@ -689,17 +782,20 @@ class DatabaseService(database_pb2_grpc.DatabaseServiceServicer):
                 stub = database_pb2_grpc.DatabaseServiceStub(channel)
                 return stub.DeleteDocument(request)
 
-            # We are primary - delete document
-            success = self.manager.current_db['db'].delete_document(request.doc_id)
+            # We are primary - delete document locally
+            success = self.manager.current_db.delete_document(request.doc_id)
 
-            # Delete shard metadata if exists
-            if success and request.doc_id in self.manager.current_db['shards'].document_shards:
-                del self.manager.current_db['shards'].document_shards[request.doc_id]
+            if not success:
+                return database_pb2.OperationResponse(
+                    success=False,
+                    message="Document not found or already deleted"
+                )
 
-            # Notify replicas to delete
+            # Notify replicas to delete the document
             replicas = self.master_stub.GetDocumentReplicas(
                 database_pb2.DocumentID(db_name=request.db_name, doc_id=request.doc_id)
             ).workers
+
             replica_addresses = [addr for addr in replicas if addr != self.worker_address]
 
             delete_request = database_pb2.DeleteRequest(
@@ -707,18 +803,29 @@ class DatabaseService(database_pb2_grpc.DatabaseServiceServicer):
                 doc_id=request.doc_id
             )
 
+            ack_count = 0
             with futures.ThreadPoolExecutor(max_workers=5) as executor:
-                for replica_addr in replica_addresses:
+                future_to_replica = {
+                    executor.submit(self._send_delete_to_replica, addr, delete_request): addr
+                    for addr in replica_addresses
+                }
+                for future in futures.as_completed(future_to_replica):
+                    replica = future_to_replica[future]
                     try:
-                        channel = self.replica_channels.get(replica_addr) or grpc.insecure_channel(replica_addr)
-                        stub = database_pb2_grpc.DatabaseServiceStub(channel)
-                        executor.submit(stub.DeleteDocument, delete_request)
+                        response = future.result()
+                        if response.success:
+                            ack_count += 1
                     except Exception as e:
-                        logger.warning(f"Failed to notify replica {replica_addr} for deletion: {str(e)}")
+                        logger.warning(f"Replica {replica} failed to delete document: {str(e)}")
+
+            logger.info(f"Delete acknowledgments received: {ack_count}/{len(replica_addresses)}")
+
+            # You may optionally mark the document as deleted in metadata if needed
+            # or do cleanup of local tracking (not shard metadata)
 
             return database_pb2.OperationResponse(
-                success=success,
-                message="Document deleted" if success else "Document not found"
+                success=True,
+                message="Document deleted"
             )
 
         except Exception as e:
@@ -728,6 +835,18 @@ class DatabaseService(database_pb2_grpc.DatabaseServiceServicer):
                 success=False,
                 message=str(e)
             )
+        
+    def _send_delete_to_replica(self, replica_addr, delete_request):
+        channel = self.replica_channels.get(replica_addr)
+        if not channel:
+            channel = grpc.insecure_channel(replica_addr)
+            self.replica_channels[replica_addr] = channel
+
+        stub = database_pb2_grpc.DatabaseServiceStub(channel)
+        return stub.DeleteDocument(delete_request)
+
+
+
 
     def ClearDatabase(self, request, context):
         try:
