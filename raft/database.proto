@@ -1,6 +1,6 @@
 syntax = "proto3";
 package database;
-
+ 
 service DatabaseService {
   // Raft RPCs
   rpc RequestVote (VoteRequest) returns (VoteResponse);
@@ -9,9 +9,11 @@ service DatabaseService {
   rpc GetLeader (Empty) returns (LeaderInfo);
   rpc Heartbeat (HeartbeatRequest) returns (HeartbeatResponse);
   rpc AddWorker (Worker) returns (OperationResponse);
+  rpc InstallSnapshot (InstallSnapshotRequest) returns (InstallSnapshotResponse);
+  
   rpc ListWorkers (Empty) returns (WorkerList);
   rpc GetDocumentReplicas (DocumentID) returns (WorkerList);
-  rpc DecrementReplicaCount (Worker) returns (OperationResponse);
+  rpc DecrementReplicaCount (DecrementReplicaCountRequest) returns (DecrementResponse);
   rpc CreateDatabase (DatabaseName) returns (OperationResponse);
   rpc UseDatabase (DatabaseName) returns (OperationResponse);
   rpc ListDatabases (Empty) returns (DatabaseList);
@@ -34,11 +36,41 @@ service DatabaseService {
 
 message Empty {}
 
+message DecrementReplicaCountRequest {
+    string doc_id = 1;
+    string worker_addr = 2;  
+}
+
+message DecrementResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+
 // Add this new message type
 message SetPrimaryRequest {
   string db_name = 1;
   string doc_id = 2;
   string worker_address = 3;
+}
+
+message InstallSnapshotRequest {
+  int32 term = 1;
+  string leader_id = 2;
+  int32 last_included_index = 3;
+  int32 last_included_term = 4;
+  bytes data = 5;
+}
+
+message InstallSnapshotResponse {
+  int32 term = 1;
+  bool success = 2;
+}
+
+message LogEntry {
+  int32 term = 1;
+  int32 index = 2;
+  bytes data = 3;
 }
 
 
@@ -47,6 +79,7 @@ message VoteRequest {
   string candidate_id = 2;
   int32 last_log_index = 3;
   int32 last_log_term = 4;
+  bool is_pre_vote=5;
 }
 
 message VoteResponse {
@@ -59,7 +92,7 @@ message AppendEntriesRequest {
   string leader_id = 2;
   int32 prev_log_index = 3;
   int32 prev_log_term = 4;
-  repeated bytes entries = 5;
+  repeated LogEntry entries = 5;
   int32 leader_commit = 6;
 }
 
