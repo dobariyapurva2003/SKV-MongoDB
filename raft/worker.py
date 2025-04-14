@@ -1,3 +1,4 @@
+import ast
 import hashlib
 import json
 import os
@@ -752,6 +753,90 @@ class DatabaseService(database_pb2_grpc.DatabaseServiceServicer):
             context.set_code(grpc.StatusCode.INTERNAL)
             context.set_details(str(e))
             return database_pb2.DocumentList()
+        
+
+
+
+    def _parse_simple_filter(self, filter_expr: str) -> tuple:
+        """Parse simple field comparison filters like:
+        - "lambda doc: doc.get('name') == 'pina'"
+        - "lambda doc: doc['age'] > 30"
+        Returns (field_name, operator, value) or (None, None, None) if not a simple filter
+        """
+        # Remove the lambda prefix if present
+        expr = filter_expr.strip()
+        if expr.startswith("lambda doc:"):
+            expr = expr[len("lambda doc:"):].strip()
+        
+        # Parse comparison operations
+        ops = [
+            ('==', 'eq'),
+            ('>', 'gt'),
+            ('<', 'lt'),
+            ('>=', 'gte'),
+            ('<=', 'lte')
+        ]
+        
+        for op_symbol, op_name in ops:
+            if op_symbol in expr:
+                parts = expr.split(op_symbol, 1)
+                if len(parts) == 2:
+                    left, right = parts
+                    field = self._extract_field_name(left.strip())
+                    if field:
+                        try:
+                            value = ast.literal_eval(right.strip())
+                            return (field, op_name, value)
+                        except (ValueError, SyntaxError):
+                            pass
+        return (None, None, None)
+    
+
+    def _extract_field_name(self, expr: str) -> Optional[str]:
+        """Extract field name from expressions like:
+        - doc.get('name')
+        - doc['age']
+        - doc.name
+        """
+        # Handle doc.get('field')
+        if expr.startswith("doc.get(") and expr.endswith(")"):
+            arg = expr[len("doc.get("):-1].strip()
+            if (arg.startswith("'") and arg.endswith("'")) or (arg.startswith('"') and arg.endswith('"')):
+                return arg[1:-1]
+        
+        # Handle doc['field']
+        elif expr.startswith("doc[") and expr.endswith("]"):
+            arg = expr[len("doc["):-1].strip()
+            if (arg.startswith("'") and arg.endswith("'")) or (arg.startswith('"') and arg.endswith('"')):
+                return arg[1:-1]
+        
+        # Handle doc.field
+        elif expr.startswith("doc."):
+            return expr[len("doc."):]
+        
+        return None
+    
+
+    def _create_filter_func(self, filter_expr: str) -> Optional[callable]:
+        """Create a filter function from the expression without using eval()"""
+        field, op, value = self._parse_simple_filter(filter_expr)
+        if field and op and value is not None:
+            if op == 'eq':
+                return lambda doc: doc.get(field) == value
+            elif op == 'gt':
+                return lambda doc: doc.get(field) > value
+            elif op == 'lt':
+                return lambda doc: doc.get(field) < value
+            elif op == 'gte':
+                return lambda doc: doc.get(field) >= value
+            elif op == 'lte':
+                return lambda doc: doc.get(field) <= value
+        
+        # For more complex filters, we could implement a simple parser
+        # But for now, we'll just return None which means "match all"
+        return None
+
+
 
     def QueryDocuments(self, request, context):
         try:
@@ -761,72 +846,42 @@ class DatabaseService(database_pb2_grpc.DatabaseServiceServicer):
             filter_expr = request.filter_expr
             results = []
 
-            import ast
+            # First try to parse as a simple field comparison that can use the index
+            field, op, value = self._parse_simple_filter(filter_expr)
+            
+            if field and op and value is not None:
+                # Check if we have an index for this field
+                index = self.manager.current_db['index_manager'].get_index(field)
+                if index:
+                    logger.info(f"Using index for field '{field}' with op '{op}' and value '{value}'")
+                    doc_ids = index.search(op, value)
+                    for doc_id in doc_ids:
+                        doc = self.manager.current_db['db'].read_document(doc_id)
+                        if doc:  # Verify document still exists
+                            results.append(json.dumps(doc))
+                    return database_pb2.DocumentList(documents=results)
+                else:
+                    logger.info(f"No index available for field '{field}'")
 
-            try:
-                # Step 1: Parse the lambda to AST without evaluating
-                expr_ast = ast.parse(filter_expr, mode='eval')
-                lambda_node = expr_ast.body
+            # Fallback to brute-force filtering without eval
+            all_docs = self.manager.current_db['db'].read_all_documents()
+            filter_func = self._create_filter_func(filter_expr)
+            
+            if filter_func:
+                for doc in all_docs:
+                    if filter_func(doc):
+                        results.append(json.dumps(doc))
+            else:
+                # If we can't parse the filter, return all documents
+                results = [json.dumps(doc) for doc in all_docs]
 
-                if isinstance(lambda_node, ast.Lambda):
-                    body = lambda_node.body
-
-                    # Step 2: Check for simple field comparison
-                    if isinstance(body, ast.Compare):
-                        left = body.left
-                        field = None
-
-                        # Handle doc.get('field')
-                        if isinstance(left, ast.Call) and getattr(left.func, 'attr', '') == 'get':
-                            if (len(left.args) >= 1 and isinstance(left.args[0], ast.Str)):
-                                field = left.args[0].s
-
-                        # Handle doc['field']
-                        elif isinstance(left, ast.Subscript) and isinstance(left.value, ast.Name) and left.value.id == 'doc':
-                            key = left.slice
-                            if isinstance(key, ast.Index):  # Python <3.9
-                                key = key.value
-                            if isinstance(key, ast.Str):
-                                field = key.s
-
-                        # Get the operator and value
-                        if field and len(body.ops) == 1 and isinstance(body.comparators[0], (ast.Constant, ast.Str, ast.Num)):
-                            op_node = body.ops[0]
-                            op_map = {
-                                ast.Eq: 'eq',
-                                ast.Gt: 'gt',
-                                ast.Lt: 'lt',
-                            }
-                            op = op_map.get(type(op_node))
-                            value = body.comparators[0].value
-
-                            if op:
-                                logger.info(f"🔎 Using index: field={field}, op={op}, value={value}")
-                                doc_ids = self.manager.current_db['index_manager'].query(field, op, value)
-                                for doc_id in doc_ids:
-                                    doc = self.manager.current_db['db'].read_document(doc_id)
-                                    if doc:  # no need to filter again, but could double check
-                                        results.append(json.dumps(doc))
-                                return database_pb2.DocumentList(documents=results)
-            except Exception as e:
-                logger.warning(f"AST parse failed or not indexable: {str(e)}")
-
-            # Step 3: Fallback to lambda eval and brute-force filtering
-            try:
-                filter_func = eval(filter_expr)
-                docs = self.manager.current_db['db'].query_documents(filter_func)
-                results = [json.dumps(doc) for doc in docs]
-                return database_pb2.DocumentList(documents=results)
-            except Exception as e:
-                logger.error(f"Lambda eval failed: {str(e)}")
-                context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
-                context.set_details("Invalid lambda expression.")
-                return database_pb2.DocumentList(documents=[])
+            return database_pb2.DocumentList(documents=results)
 
         except Exception as e:
             logger.error(f"QueryDocuments failed: {str(e)}", exc_info=True)
             context.set_code(grpc.StatusCode.INTERNAL)
             return database_pb2.DocumentList(documents=[])
+
 
 
 
