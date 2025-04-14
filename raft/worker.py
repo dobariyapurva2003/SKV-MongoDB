@@ -90,6 +90,107 @@ class ShardMetadata:
 
     def get_all_shard_workers(self) -> List[str]:
         return list(self.shard_workers)
+    
+class BPlusTree:
+    def __init__(self, order=3):
+        self.order = order
+        self.root = BPlusTreeNode(is_leaf=True)
+    
+    def insert(self, value, doc_id):
+        node = self._find_leaf(value)
+        node.insert(value, doc_id)
+        
+        if len(node.keys) > self.order:
+            self._split_node(node)
+
+    def _find_leaf(self, value):
+        """Find the leaf node where the value should go."""
+        node = self.root
+        while not node.is_leaf:
+            node = node.get_child(value)
+        return node
+
+    def _split_node(self, node):
+        """Handle the splitting of a full node."""
+        middle_key = node.keys[len(node.keys) // 2]
+        new_node = BPlusTreeNode(is_leaf=node.is_leaf)
+        node.split(new_node)
+
+        # If it's the root node, create a new root
+        if node == self.root:
+            new_root = BPlusTreeNode(is_leaf=False)
+            new_root.keys.append(middle_key)
+            new_root.children = [node, new_node]
+            self.root = new_root
+        else:
+            parent_node = node.parent
+            parent_node.insert(middle_key, new_node)
+
+    def search(self, op, value):
+        """Search for a value in the B+ Tree."""
+        node = self._find_leaf(value)
+        return node.search(op, value)
+    
+    def delete(self, value, doc_id):
+        node = self._find_leaf(value)
+        node.delete(value, doc_id)
+
+
+    
+class BPlusTreeNode:
+    def __init__(self, is_leaf=False):
+        self.is_leaf = is_leaf
+        self.keys = []
+        self.children = []
+
+    def insert(self, value, doc_id):
+        """Insert key-value pair (value, doc_id) into this node."""
+        self.keys.append((value, doc_id))
+        self.keys.sort()  # Ensure keys are sorted
+
+    def search(self, op, value):
+        """Search for values in the node."""
+        return [doc_id for val, doc_id in self.keys if self._compare(op, val, value)]
+
+    def _compare(self, op, key, value):
+        """Compare keys using the operation provided (e.g., equals, greater than, etc.)."""
+        if op == 'eq':
+            return key == value
+        elif op == 'gt':
+            return key > value
+        elif op == 'lt':
+            return key < value
+        return False
+    
+    def delete(self, value, doc_id):
+        self.keys = [(v, d) for v, d in self.keys if not (v == value and d == doc_id)]
+
+
+
+class IndexManager:
+    def __init__(self):
+        self.indexes = {}  # field -> BPlusTree
+
+    def create_index(self, field):
+        """Creates an index for a given field."""
+        if field not in self.indexes:
+            self.indexes[field] = BPlusTree()
+
+    def insert(self, field, value, doc_id):
+        if field in self.indexes:
+            self.indexes[field].insert(value, doc_id)
+
+    def get_index(self, field):
+        """Returns the index for a field."""
+        return self.indexes.get(field)
+
+    def query(self, field, op, value):
+        """Performs a query on the index."""
+        index = self.get_index(field)
+        if not index:
+            return []
+        return index.search(op, value)  # Custom method in your B+ Tree
+
 
 class DatabaseManager:
     def __init__(self):
@@ -125,13 +226,28 @@ class DatabaseManager:
             if os.path.exists(f"{db_name}.json"):
                 self.databases[db_name] = {
                     'db': SimpleJSONDB(f"{db_name}.json"),
-                    'shards': ShardMetadata()
+                    'shards': ShardMetadata(),
+                    'index_manager': IndexManager()  # Initialize the IndexManager for the database
                 }
+
             else:
                 raise ValueError(f"Database '{db_name}' doesn't exist")
         self.current_db = self.databases[db_name]
         print(f"current db : " , self.current_db['db'])
+        print(f"Type of current_db['db']: {type(self.current_db['db'])}")  # This should now print
         return self.current_db['db']
+    
+    # Inside DatabaseManager
+    def create_document(self, document: Dict, doc_id: str) -> None:
+        self.current_db['db'].create_document(document, doc_id)  # <- persists to disk!
+        print(f"Type of current_db['db']: {type(self.current_db['db'])}")
+
+        
+        # Update B+ Tree indexes
+        for field, index in self.current_db['index_manager'].indexes.items():
+            if field in document:
+                self.current_db['index_manager'].insert(field, document[field], doc_id)
+
 
 class DatabaseService(database_pb2_grpc.DatabaseServiceServicer):
     def __init__(self, worker_address: str, master_addresses: str):
@@ -312,22 +428,30 @@ class DatabaseService(database_pb2_grpc.DatabaseServiceServicer):
                     # Corrupted file - overwrite it
                     pass
 
-            # Create with file lock
+            # Create empty database file
             with open(db_file, 'w') as f:
                 json.dump({}, f)
                 f.flush()
-                os.fsync(f.fileno())  # Force write to disk
+                os.fsync(f.fileno())
 
-            # Ensure immediate visibility in manager
+            # Initialize IndexManager
+            index_manager = IndexManager()
+
+            # Create indexes passed from master
+            for field in request.indexes:
+                index_manager.create_index(field)
+
+            # Store database in manager
             if request.name not in self.manager.databases:
                 self.manager.databases[request.name] = {
                     'db': SimpleJSONDB(db_file),
+                    'index_manager': index_manager,
                     'shards': ShardMetadata()
                 }
                 self.manager.current_db = self.manager.databases[request.name]
-                print(f"database at worker side stored : " , self.manager.current_db)
+                print(f"Database at worker side stored: {self.manager.current_db}")
 
-            # Verify creation
+            # Verify file creation
             if not os.path.exists(db_file):
                 return database_pb2.OperationResponse(
                     success=False,
@@ -336,14 +460,16 @@ class DatabaseService(database_pb2_grpc.DatabaseServiceServicer):
 
             return database_pb2.OperationResponse(
                 success=True,
-                message=f"Database '{request.name}' created"
+                message=f"Database '{request.name}' created with indexes: {list(request.indexes)}"
             )
+
         except Exception as e:
             return database_pb2.OperationResponse(
                 success=False,
                 message=str(e)
             )
-        
+
+
     def UseDatabase(self, request, context):
         try:
             db_file = f"{request.name}.json"
@@ -372,8 +498,10 @@ class DatabaseService(database_pb2_grpc.DatabaseServiceServicer):
                 )
             
             # Now use it
-            self.manager.current_db =self.manager.use_database(request.name)
+            self.manager.use_database(request.name)
             print(f"database created by worker")
+            print(f"Type of current_db['db']: {type(self.manager.current_db['db'])}")
+
 
             return database_pb2.OperationResponse(
                 success=True,
@@ -418,7 +546,7 @@ class DatabaseService(database_pb2_grpc.DatabaseServiceServicer):
             logger.info(f"CreateDocument received for db={request.db_name}, doc_id={request.doc_id}")
             
             #if not self.manager.current_db or self.manager.current_db['db'].db_file != f"{request.db_name}.json":
-            if not self.manager.current_db or self.manager.current_db.db_file != f"{request.db_name}.json":
+            if not self.manager.current_db or self.manager.current_db['db'].db_file != f"{request.db_name}.json":
                 self.manager.use_database(request.db_name)
             
             doc_id = request.doc_id or str(uuid.uuid4())
@@ -434,7 +562,12 @@ class DatabaseService(database_pb2_grpc.DatabaseServiceServicer):
             # Store document locally
             # self.manager.current_db['db'].create_document(doc_data, doc_id)
             # Correct:
-            self.manager.current_db.create_document(doc_data, doc_id)
+            self.manager.current_db['db'].create_document(doc_data, doc_id)
+
+             # Update Indexes (B+ Tree) for relevant fields
+            for field, index in self.manager.current_db['index_manager'].indexes.items():
+                if field in doc_data:
+                    index.insert(doc_data[field], doc_id)
 
             
             # Get replica workers from master
@@ -527,43 +660,54 @@ class DatabaseService(database_pb2_grpc.DatabaseServiceServicer):
     def ReplicateDocument(self, request, context):
         """Handle document replication from primary"""
         try:
-            if not self.manager.current_db or self.manager.current_db.db_file != f"{request.db_name}.json":
+            logger.info(f"Replicating document {request.doc_id} to {self.worker_address}")
+
+            # Ensure the right DB is selected
+            if not self.manager.current_db or self.manager.current_db['db'].db_file != f"{request.db_name}.json":
                 self.manager.use_database(request.db_name)
-            
+
+            db = self.manager.current_db['db']
             doc_data = json.loads(request.document)
             doc_id = request.doc_id
-            
-            if doc_id in self.manager.current_db.data:
-                current_doc = self.manager.current_db.data[doc_id]
-                current_doc.update(doc_data)
+
+            existing_doc = db.read_document(doc_id)
+
+            if existing_doc:
+                logger.info(f"Document {doc_id} exists, updating...")
+                existing_doc.update(doc_data)
                 if '_primary' in doc_data:
-                    current_doc['_primary'] = doc_data['_primary']
-                current_doc['_updated_at'] = datetime.now().isoformat()
+                    existing_doc['_primary'] = doc_data['_primary']
+                existing_doc['_updated_at'] = datetime.now().isoformat()
+                db._save()
             else:
+                logger.info(f"Document {doc_id} does not exist, creating...")
                 doc_data['_created_at'] = datetime.now().isoformat()
                 doc_data['_updated_at'] = datetime.now().isoformat()
-                self.manager.current_db.create_document(doc_data, doc_id)
-            
-            print(f"document replicated on this worker")
+                db.create_document(doc_data, doc_id)
+
+            logger.info(f"Replication successful for document {doc_id}")
             return database_pb2.OperationResponse(success=True)
+
         except Exception as e:
+            logger.error(f"Replication failed: {str(e)}", exc_info=True)
             context.set_code(grpc.StatusCode.INTERNAL)
             return database_pb2.OperationResponse(
                 success=False,
                 message=str(e)
             )
 
+
     def ReadDocument(self, request, context):
         try:
             logger.info(f"ReadDocument: db={request.db_name} doc_id={request.doc_id}")
             
             # Ensure correct database is loaded
-            if not self.manager.current_db or self.manager.current_db.db_file != f"{request.db_name}.json":
+            if not self.manager.current_db or self.manager.current_db['db'].db_file != f"{request.db_name}.json":
                 self.manager.use_database(request.db_name)
                 logger.info(f"Loaded database {request.db_name}")
             
             # Try local read first
-            doc = self.manager.current_db.read_document(request.doc_id)
+            doc = self.manager.current_db['db'].read_document(request.doc_id)   
             if doc:
                 logger.info(f"Found document locally: {doc}")
                 return database_pb2.DocumentResponse(document=json.dumps(doc))
@@ -600,9 +744,9 @@ class DatabaseService(database_pb2_grpc.DatabaseServiceServicer):
 
     def ReadAllDocuments(self, request, context):
         try:
-            if not self.manager.current_db or self.manager.current_db.db_file != f"{request.name}.json":
+            if not self.manager.current_db or self.manager.current_db['db'].db_file != f"{request.name}.json":
                 self.manager.use_database(request.name)
-            docs = self.manager.current_db.read_all_documents()
+            docs = self.manager.current_db['db'].read_all_documents()
             return database_pb2.DocumentList(documents=[json.dumps(doc) for doc in docs])
         except Exception as e:
             context.set_code(grpc.StatusCode.INTERNAL)
@@ -611,46 +755,101 @@ class DatabaseService(database_pb2_grpc.DatabaseServiceServicer):
 
     def QueryDocuments(self, request, context):
         try:
-            if not self.manager.current_db or self.manager.current_db['db'].db_file != f"{request.db_name}.json":
-                self.manager.use_database(request.db_name)
-            filter_func = eval(request.filter_expr)
-            if not callable(filter_func):
-                raise ValueError("Filter expression must be callable")
-            docs = self.manager.current_db['db'].query_documents(filter_func)
-            return database_pb2.DocumentList(documents=[json.dumps(doc) for doc in docs])
+            logger.info(f"QueryDocuments called on db={request.db_name} with filter_expr={request.filter_expr}")
+            self.manager.use_database(request.db_name)
+
+            filter_expr = request.filter_expr
+            results = []
+
+            import ast
+
+            try:
+                # Step 1: Parse the lambda to AST without evaluating
+                expr_ast = ast.parse(filter_expr, mode='eval')
+                lambda_node = expr_ast.body
+
+                if isinstance(lambda_node, ast.Lambda):
+                    body = lambda_node.body
+
+                    # Step 2: Check for simple field comparison
+                    if isinstance(body, ast.Compare):
+                        left = body.left
+                        field = None
+
+                        # Handle doc.get('field')
+                        if isinstance(left, ast.Call) and getattr(left.func, 'attr', '') == 'get':
+                            if (len(left.args) >= 1 and isinstance(left.args[0], ast.Str)):
+                                field = left.args[0].s
+
+                        # Handle doc['field']
+                        elif isinstance(left, ast.Subscript) and isinstance(left.value, ast.Name) and left.value.id == 'doc':
+                            key = left.slice
+                            if isinstance(key, ast.Index):  # Python <3.9
+                                key = key.value
+                            if isinstance(key, ast.Str):
+                                field = key.s
+
+                        # Get the operator and value
+                        if field and len(body.ops) == 1 and isinstance(body.comparators[0], (ast.Constant, ast.Str, ast.Num)):
+                            op_node = body.ops[0]
+                            op_map = {
+                                ast.Eq: 'eq',
+                                ast.Gt: 'gt',
+                                ast.Lt: 'lt',
+                            }
+                            op = op_map.get(type(op_node))
+                            value = body.comparators[0].value
+
+                            if op:
+                                logger.info(f"🔎 Using index: field={field}, op={op}, value={value}")
+                                doc_ids = self.manager.current_db['index_manager'].query(field, op, value)
+                                for doc_id in doc_ids:
+                                    doc = self.manager.current_db['db'].read_document(doc_id)
+                                    if doc:  # no need to filter again, but could double check
+                                        results.append(json.dumps(doc))
+                                return database_pb2.DocumentList(documents=results)
+            except Exception as e:
+                logger.warning(f"AST parse failed or not indexable: {str(e)}")
+
+            # Step 3: Fallback to lambda eval and brute-force filtering
+            try:
+                filter_func = eval(filter_expr)
+                docs = self.manager.current_db['db'].query_documents(filter_func)
+                results = [json.dumps(doc) for doc in docs]
+                return database_pb2.DocumentList(documents=results)
+            except Exception as e:
+                logger.error(f"Lambda eval failed: {str(e)}")
+                context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+                context.set_details("Invalid lambda expression.")
+                return database_pb2.DocumentList(documents=[])
+
         except Exception as e:
-            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
-            context.set_details(str(e))
-            return database_pb2.DocumentList()
+            logger.error(f"QueryDocuments failed: {str(e)}", exc_info=True)
+            context.set_code(grpc.StatusCode.INTERNAL)
+            return database_pb2.DocumentList(documents=[])
+
+
+
+
 
     def UpdateDocument(self, request, context):
         try:
             logger.info(f"UpdateDocument: db={request.db_name}, doc_id={request.doc_id}")
-            logger.info(f"[WORKER] Update request for doc {request.doc_id} on DB {request.db_name}")
-            print("Available doc keys:", list(self.manager.current_db.data.keys()))
 
             # Step 1: Ensure correct database
-            if not self.manager.current_db or self.manager.current_db.db_file != f"{request.db_name}.json":
+            if not self.manager.current_db or self.manager.current_db['db'].db_file != f"{request.db_name}.json":
                 logger.info(f"Switching to database {request.db_name}")
                 self.manager.use_database(request.db_name)
 
-            
-            
             # Step 2: Retrieve document
-            current_doc = self.manager.current_db.read_document(request.doc_id)
-
-            if current_doc is None:
-                logger.warning(f"[WORKER] Document {request.doc_id} not found in worker memory.")
-
+            current_doc = self.manager.current_db['db'].read_document(request.doc_id)
             if not current_doc:
                 logger.info(f"Document {request.doc_id} not found in {request.db_name}")
                 context.set_code(grpc.StatusCode.NOT_FOUND)
-                return database_pb2.OperationResponse(
-                    success=False,
-                    message="Document not found"
-                )
+                return database_pb2.OperationResponse(success=False, message="Document not found")
+
             logger.info(f"Found document {request.doc_id}: {current_doc}")
-            
+
             # Step 3: Check if primary
             if not current_doc.get('_primary', False):
                 logger.info(f"Worker {self.worker_address} is not primary for {request.doc_id}")
@@ -659,48 +858,45 @@ class DatabaseService(database_pb2_grpc.DatabaseServiceServicer):
                 )
                 if not primary_worker.worker:
                     logger.warning("No primary worker found for document")
-                    return database_pb2.OperationResponse(
-                        success=False,
-                        message="No primary worker found for document"
-                    )
-                logger.info(f"Forwarding update to primary {primary_worker.worker}")
-                # channel = self.replica_channels.get(primary_worker.worker) or grpc.insecure_channel(primary_worker.worker)
-                # stub = database_pb2_grpc.DatabaseServiceStub(channel)
+                    return database_pb2.OperationResponse(success=False, message="No primary worker found for document")
 
                 primary_addr = primary_worker.worker
-                # Forward request to primary
                 if primary_addr not in self.replica_channels:
                     self.replica_channels[primary_addr] = grpc.insecure_channel(primary_addr)
                 stub = database_pb2_grpc.DatabaseServiceStub(self.replica_channels[primary_addr])
-
                 return stub.UpdateDocument(request)
-            
-            # Step 4: Perform local update (primary)
+
+            # Step 4: Prepare index update
             updates = json.loads(request.updates)
+            index_manager = self.manager.current_db['index_manager']
+            for field, index in index_manager.indexes.items():
+                if field in current_doc:
+                    index.delete(current_doc[field], request.doc_id)  # remove old value
+
+            # Step 5: Perform update
             current_doc.update(updates)
             current_doc['_updated_at'] = datetime.now().isoformat()
             current_doc['_version'] = current_doc.get('_version', 0) + 1
-            self.manager.current_db._save()
+            self.manager.current_db['db']._save()
+
+            # Step 6: Insert updated values into index
+            for field, index in index_manager.indexes.items():
+                if field in updates:
+                    index.insert(updates[field], request.doc_id)
+
             logger.info(f"Document {request.doc_id} updated locally on primary {self.worker_address}: {current_doc}")
-            
-            # Step 5: Replicate to secondaries
+
+            # Step 7: Replicate to secondaries
             replication_status = self._replicate_document(request.db_name, request.doc_id, current_doc)
-            
-            # Step 6: Return success regardless of replication outcome
-            logger.info(f"Update completed: {replication_status}")
-            return database_pb2.OperationResponse(
-                success=True,
-                message=replication_status
-            )
-        
+
+            return database_pb2.OperationResponse(success=True, message=replication_status)
+
         except Exception as e:
             logger.error(f"UpdateDocument failed: {str(e)}", exc_info=True)
             context.set_code(grpc.StatusCode.INTERNAL)
-            return database_pb2.OperationResponse(
-                success=False,
-                message=f"Update failed: {str(e)}"
-            )
-        
+            return database_pb2.OperationResponse(success=False, message=f"Update failed: {str(e)}")
+
+    
 
     def _replicate_document(self, db_name: str, doc_id: str, current_doc: dict) -> str:
         """Handle replication to secondary workers"""
@@ -757,10 +953,10 @@ class DatabaseService(database_pb2_grpc.DatabaseServiceServicer):
         try:
             logger.info(f"DeleteDocument: db={request.db_name}, doc_id={request.doc_id}")
 
-            if not self.manager.current_db or self.manager.current_db.db_file != f"{request.db_name}.json":
+            if not self.manager.current_db or self.manager.current_db['db'].db_file != f"{request.db_name}.json":
                 self.manager.use_database(request.db_name)
 
-            current_doc = self.manager.current_db.read_document(request.doc_id)
+            current_doc = self.manager.current_db['db'].read_document(request.doc_id)
             if not current_doc:
                 context.set_code(grpc.StatusCode.NOT_FOUND)
                 return database_pb2.OperationResponse(
@@ -784,7 +980,7 @@ class DatabaseService(database_pb2_grpc.DatabaseServiceServicer):
                 return stub.DeleteDocument(request)
 
             # We are primary - delete document locally
-            success = self.manager.current_db.delete_document(request.doc_id)
+            success = self.manager.current_db['db'].delete_document(request.doc_id)
 
             if not success:
                 return database_pb2.OperationResponse(
@@ -909,4 +1105,3 @@ if __name__ == '__main__':
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 50051
     master_addrs = sys.argv[2:] if len(sys.argv) > 2 else ["localhost:50050"]
     serve_worker(port, master_addrs)
- 
