@@ -3,7 +3,7 @@ import json
 import database_pb2
 import database_pb2_grpc
 from concurrent.futures import ThreadPoolExecutor
-from typing import Optional
+from typing import List, Optional
  
 class DatabaseClient:
     def __init__(self, master_address="localhost:50050"):
@@ -67,8 +67,19 @@ class DatabaseClient:
         cmd = parts[0].lower()
 
         try:
-            if cmd == "create" and len(parts) == 2:
-                return self.create_database(parts[1])
+            if cmd == "create" and len(parts) >= 2:
+                db_name = parts[1]
+                index_fields = []
+                if len(parts) > 2:
+                    # Try to parse index fields as a Python list string
+                    try:
+                        index_fields = eval(" ".join(parts[2:]))
+                        if not isinstance(index_fields, list):
+                            return "Index fields must be a list like ['name', 'email']"
+                    except Exception as e:
+                        return f"Invalid index field list: {e}"
+                return self.create_database(db_name, index_fields)
+
             elif cmd == "use" and len(parts) == 2:
                 return self.use_database(parts[1])
             elif cmd == "list":
@@ -108,11 +119,12 @@ class DatabaseClient:
         except Exception as e:
             return f"Error: {str(e)}"
 
-    def create_database(self, db_name: str) -> str:
+    def create_database(self, db_name: str , indexes: Optional[List[str]] = None) -> str:
         master_addr = self.get_leader()
         stub = database_pb2_grpc.DatabaseServiceStub(grpc.insecure_channel(master_addr))
         response = stub.CreateDatabase(
-            database_pb2.DatabaseName(name=db_name)
+            database_pb2.DatabaseName(name=db_name , indexes=indexes if indexes else []  # Pass list of index fields)
+            )
         )
         return response.message
 
