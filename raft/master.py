@@ -1331,6 +1331,8 @@ class MasterService(database_pb2_grpc.DatabaseServiceServicer):
                     request, 
                     timeout=5
                 )
+                logger.info(f"Creating database {request.name} with indexes: {list(request.indexes)}")
+
                 
                 if not worker_response.success:
                     continue  # Will retry
