@@ -82,7 +82,12 @@ class DatabaseClient:
             elif cmd == "readall":
                 return self.read_all_documents()
             elif cmd == "query" and len(parts) >= 2:
-                return self.query_documents(" ".join(parts[1:]))
+                #return self.query_documents(" ".join(parts[1:]))
+                expr = " ".join(parts[1:])
+                if (expr.startswith('"') and expr.endswith('"')) or (expr.startswith("'") and expr.endswith("'")):
+                    expr = expr[1:-1]  # Strip the outer quotes
+                return self.query_documents(expr)
+
             elif cmd == "update" and len(parts) >= 3:
                 return self.update_document(parts[1], " ".join(parts[2:]))
             elif cmd == "delete_doc" and len(parts) == 2:
@@ -307,14 +312,18 @@ class DatabaseClient:
         if not self.current_db:
             return "No database selected. Use 'use <db_name>' first."
         
+        # print(f"Received filter_expr: {filter_expr}")
+
         # Get primary worker
-        worker = self.master_stub.GetPrimaryWorker(
+        master_addr = self.get_leader()
+        stub = database_pb2_grpc.DatabaseServiceStub(grpc.insecure_channel(master_addr))
+        worker = stub.GetPrimaryWorker(
             database_pb2.DatabaseName(name=self.current_db))
         
-        if not worker.address:
+        if not worker.worker:
             return "No primary worker available"
         
-        worker_stub = self.get_worker_stub(worker.address)
+        worker_stub = self.get_worker_stub(worker.worker)
         response = worker_stub.QueryDocuments(
             database_pb2.QueryRequest(
                 db_name=self.current_db,
