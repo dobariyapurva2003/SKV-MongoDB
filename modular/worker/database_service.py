@@ -4,6 +4,7 @@ import json
 import os
 import threading
 from typing import List, Dict, Optional
+from typing import Tuple
 import uuid
 from datetime import datetime
 from concurrent import futures
@@ -29,6 +30,29 @@ class DatabaseService(database_pb2_grpc.WorkerServiceServicer):
         self.master_stub: Optional[database_pb2_grpc.MasterServiceStub] = None
         self.replica_channels: Dict[str, grpc.Channel] = {}  # Cache for replica channels
         self.shard_metadata = ShardMetadata()  # Initialize shard metadata
+
+        # Connection management
+        self.leader_lock = threading.Lock()
+        self.retry_backoff = 1.0  # Initial backoff in seconds
+        self.max_backoff = 30.0   # Maximum backoff time
+        self.heartbeat_interval = 5  # Seconds between heartbeats
+        self.stop_flag = False  # Added missing stop_flag
+
+        # Add these new attributes
+        self.leader_validation_interval = 10  # Seconds between leader validations
+        self.last_leader_validation = 0
+        self.healthy_leader = False
+
+        # Enhanced connection parameters
+        self.connection_timeout = 3.0  # seconds
+        self.max_reconnect_attempts = 5
+        self.leader_retry_interval = 1.0
+        self.max_port_attempts = 3  # Try multiple ports if needed
+        self.leader_health_threshold = 3  # consecutive failures before marking unhealthy
+        self.leader_health_count = 0
+        self.channel_cache = {}  # To store and manage channels
+        self.current_master_index = 0  # Add this line
+        
         
         # Initialize master connection
         self._discover_master_leader()
@@ -41,16 +65,166 @@ class DatabaseService(database_pb2_grpc.WorkerServiceServicer):
         self.leader_monitor_thread = threading.Thread(target=self._monitor_leader, daemon=True)
         self.leader_monitor_thread.start()
 
+    def stop(self):
+        """Clean up all channels on shutdown"""
+        for channel in self.channel_cache.values():
+            channel.close()
+        self.channel_cache.clear()
+        if self.master_channel:
+            self.master_channel.close()
+
+    def _try_connect_leader(self, leader_address: str) -> Optional[Tuple[grpc.Channel, database_pb2_grpc.MasterServiceStub]]:
+        """Try multiple connection approaches to the leader"""
+        # Try standard port first
+        try:
+            if leader_address in self.channel_cache:
+                channel = self.channel_cache[leader_address]
+            else:
+                channel = grpc.insecure_channel(leader_address)
+                self.channel_cache[leader_address] = channel
+            
+            stub = database_pb2_grpc.MasterServiceStub(channel)
+            # Verify connection
+            resp = stub.GetLeader(database_pb2.Empty(), timeout=2)
+            if resp.leader_address == leader_address.split(':')[0]:
+                return channel, stub
+        except grpc.RpcError:
+            pass
+
+        # If standard port fails, try common alternatives
+        possible_ports = [50050, 50051, 50052]  # Add all possible ports
+        host = leader_address.split(':')[0]
+        
+        for port in possible_ports:
+            addr = f"{host}:{port}"
+            try:
+                if addr in self.channel_cache:
+                    channel = self.channel_cache[addr]
+                else:
+                    channel = grpc.insecure_channel(addr)
+                    self.channel_cache[addr] = channel
+                
+                stub = database_pb2_grpc.MasterServiceStub(channel)
+                resp = stub.GetLeader(database_pb2.Empty(), timeout=2)
+                if resp.leader_address:
+                    logger.info(f"Connected to leader on alternate port {port}")
+                    return channel, stub
+            except grpc.RpcError:
+                continue
+
+        return None, None
+
+
+    def _create_secure_channel(self, address: str) -> grpc.Channel:
+        """Create a channel with proper timeout and retry policies"""
+        options = [
+            ('grpc.keepalive_time_ms', 10000),
+            ('grpc.keepalive_timeout_ms', 5000),
+            ('grpc.keepalive_permit_without_calls', 1),
+            ('grpc.http2.max_pings_without_data', 0),
+            ('grpc.http2.min_time_between_pings_ms', 10000),
+            ('grpc.http2.min_ping_interval_without_data_ms', 5000),
+        ]
+        return grpc.insecure_channel(address, options=options)
+    
+    def _rediscover_leader(self) -> Optional[database_pb2_grpc.MasterServiceStub]:
+        """Leader discovery with current_master_index"""
+        last_error = None
+        
+        for i in range(len(self.master_addresses)):
+            try:
+                idx = (self.current_master_index + i) % len(self.master_addresses)
+                addr = self.master_addresses[idx]
+                
+                channel = grpc.insecure_channel(addr)
+                stub = database_pb2_grpc.MasterServiceStub(channel)
+                
+                leader_info = stub.GetLeader(database_pb2.Empty(), timeout=2)
+                
+                if not leader_info.leader_address:
+                    continue
+                    
+                # Try connecting to reported leader
+                leader_channel = grpc.insecure_channel(leader_info.leader_address)
+                leader_stub = database_pb2_grpc.MasterServiceStub(leader_channel)
+                
+                # Verify leadership
+                verify_response = leader_stub.GetLeader(database_pb2.Empty(), timeout=2)
+                if verify_response.leader_address == leader_info.leader_address:
+                    with self.leader_lock:
+                        if self.master_channel:
+                            self.master_channel.close()
+                        
+                        self.current_leader = leader_info.leader_address
+                        self.master_channel = leader_channel
+                        self.master_stub = leader_stub
+                        self.current_master_index = idx
+                        
+                        logger.info(f"Connected to new leader at {self.current_leader}")
+                        return leader_stub
+                
+            except grpc.RpcError as e:
+                last_error = f"Failed to connect to {addr}: {e.details()}"
+                continue
+                
+        logger.error(f"Could not discover leader. Last error: {last_error}")
+        return None
+
+    def _validate_leader(self, stub: database_pb2_grpc.MasterServiceStub) -> bool:
+        """Robust leader validation with health tracking"""
+        try:
+            response = stub.GetLeader(
+                database_pb2.Empty(), 
+                timeout=self.connection_timeout
+            )
+            if response.leader_address == self.current_leader:
+                self.leader_health_count = max(0, self.leader_health_count - 1)
+                return True
+            
+            logger.info(f"Leader changed from {self.current_leader} to {response.leader_address}")
+            return False
+        except grpc.RpcError as e:
+            self.leader_health_count += 1
+            if self.leader_health_count >= self.leader_health_threshold:
+                logger.warning(f"Leader validation failed {self.leader_health_count} times: {str(e)}")
+                return False
+            return True  # Give leader a few chances before marking unhealthy
+        except Exception as e:
+            logger.error(f"Unexpected validation error: {str(e)}")
+            return False
+        
+    def _get_leader_stub(self) -> Optional[database_pb2_grpc.MasterServiceStub]:
+        """Get validated leader stub with connection pooling"""
+        if not self.current_leader:
+            return self._rediscover_leader()
+        
+        try:
+            if not self.master_channel or self.master_channel._channel.check_connectivity_state(False) != grpc.ChannelConnectivity.READY:
+                self.master_channel = grpc.insecure_channel(self.current_leader)
+                self.master_stub = database_pb2_grpc.MasterServiceStub(self.master_channel)
+            
+            # Quick validation
+            response = self.master_stub.GetLeader(database_pb2.Empty(), timeout=1)
+            if response.leader_address == self.current_leader:
+                return self.master_stub
+                
+        except Exception as e:
+            logger.warning(f"Leader stub validation failed: {str(e)}")
+        
+        return self._rediscover_leader()
+    
+    
     def _register_with_master(self, max_retries: int = 5) -> bool:
         """Register this worker with the master cluster"""
         for attempt in range(max_retries):
+            if self.stop_flag:
+                return False
             try:
-                if not self.current_leader:
-                    self._discover_master_leader()
-                    if not self.current_leader:
-                        logger.warning(f"Registration attempt {attempt+1}: No master leader available")
-                        time.sleep(1)
-                        continue
+                stub = self._get_leader_stub()
+                if not stub:
+                    logger.warning(f"Registration attempt {attempt+1}: No master leader available")
+                    time.sleep(1)
+                    continue
                 
                 logger.info(f"Attempting to register with master at {self.current_leader}")
                 channel = grpc.insecure_channel(self.current_leader)
@@ -70,7 +244,12 @@ class DatabaseService(database_pb2_grpc.WorkerServiceServicer):
                     logger.warning(f"Registration attempt {attempt+1} failed: {response.message}")
             except Exception as e:
                 logger.warning(f"Registration attempt {attempt+1} failed with error: {str(e)}")
-                self.current_leader = None  # Force rediscovery
+                with self.leader_lock:
+                    self.current_leader = None
+                    self.master_stub = None
+                    if self.master_channel:
+                        self.master_channel.close()
+                        self.master_channel = None
             
             time.sleep(1)  # Wait before retrying
         
@@ -100,22 +279,49 @@ class DatabaseService(database_pb2_grpc.WorkerServiceServicer):
         self.master_stub = None
 
     def _monitor_leader(self) -> None:
-        """Continuously monitor leader status"""
-        while True:
-            if not self.current_leader:
-                self._discover_master_leader()
-                time.sleep(1)
-                continue
-            
+        """Enhanced leader monitoring with better error handling"""
+        while not self.stop_flag:
             try:
-                # Check if leader is still responsive
-                self.master_stub.GetLeader(database_pb2.Empty(), timeout=1)
-                time.sleep(5)  # Check every 5 seconds
-            except:
-                # Leader may have changed
-                logger.warning("Lost connection to master leader, rediscovering...")
-                self._discover_master_leader()
+                # Get current leader stub with validation
+                stub = self._get_leader_stub()
+                
+                if not stub:
+                    logger.warning("No leader stub available, retrying...")
+                    time.sleep(1)
+                    continue
+
+                # Check leader responsiveness
+                try:
+                    response = stub.GetLeader(database_pb2.Empty(), timeout=2)
+                    if not response.leader_address:
+                        raise grpc.RpcError("Empty leader response")
+                    
+                    # Verify we're still connected to the actual leader
+                    if response.leader_address != self.current_leader:
+                        logger.info(f"Leader changed from {self.current_leader} to {response.leader_address}")
+                        with self.leader_lock:
+                            self.current_leader = response.leader_address
+                            if self.master_channel:
+                                self.master_channel.close()
+                            self.master_channel = grpc.insecure_channel(self.current_leader)
+                            self.master_stub = database_pb2_grpc.MasterServiceStub(self.master_channel)
+                    
+                    time.sleep(self.heartbeat_interval)
+                    
+                except grpc.RpcError as e:
+                    logger.warning(f"Leader check failed: {e.details()}")
+                    with self.leader_lock:
+                        self.current_leader = None
+                        if self.master_channel:
+                            self.master_channel.close()
+                            self.master_channel = None
+                        self.master_stub = None
+                    time.sleep(1)
+                    
+            except Exception as e:
+                logger.error(f"Unexpected error in leader monitor: {str(e)}")
                 time.sleep(1)
+
 
     def _discover_workers(self) -> None:
         """Discover other workers in the cluster"""
@@ -124,7 +330,12 @@ class DatabaseService(database_pb2_grpc.WorkerServiceServicer):
             
         for _ in range(5):  # Retry 5 times
             try:
-                response = self.master_stub.ListWorkers(database_pb2.Empty())
+                stub = self._get_leader_stub()
+                if not stub:
+                    time.sleep(1)
+                    continue
+
+                response = stub.ListWorkers(database_pb2.Empty())
                 self.known_workers = list(response.workers)
                 logger.info(f"Discovered workers: {self.known_workers}")
                 break
@@ -136,31 +347,60 @@ class DatabaseService(database_pb2_grpc.WorkerServiceServicer):
             logger.info(f"Fallback to default workers: {self.known_workers}")
 
     def _send_heartbeats(self) -> None:
-        """Send periodic heartbeat messages to master"""
-        while True:
-            if not self.current_leader or not self.master_stub:
-                logger.info("No leader available, retrying discovery...")
-                self._discover_master_leader()
-                time.sleep(1)
-                continue
-            
+        """Heartbeat implementation without timestamp"""
+        while not self.stop_flag:
             try:
-                response = self.master_stub.Heartbeat(
-                    database_pb2.HeartbeatRequest(
-                        worker_address=self.worker_address
-                    ),
-                    timeout=2
-                )
-                if response.acknowledged:
-                    logger.info("Heartbeat acknowledged by leader")
-                else:
-                    logger.warning("Heartbeat not acknowledged, leader may have changed")
-                    self._discover_master_leader()
+                stub = self._get_leader_stub()
+                if not stub:
+                    time.sleep(1)
+                    continue
+
+                try:
+                    response = stub.Heartbeat(
+                        database_pb2.HeartbeatRequest(
+                            worker_address=self.worker_address
+                            # Remove timestamp if not in proto definition
+                        ),
+                        timeout=self.connection_timeout
+                    )
+                    
+                    if response.acknowledged:
+                        self.leader_health_count = max(0, self.leader_health_count - 1)
+                    else:
+                        self._handle_leader_failure()
+                        
+                except grpc.RpcError as e:
+                    self._handle_leader_failure(e.code())
+                    
             except Exception as e:
-                logger.error(f"Heartbeat failed: {str(e)}")
-                self._discover_master_leader()
+                logger.error(f"Unexpected heartbeat error: {str(e)}")
+                self._handle_leader_failure()
             
-            time.sleep(5)  # Send heartbeat every 5 seconds
+            time.sleep(self.heartbeat_interval)
+
+
+    def _handle_leader_failure(self, error_code=None):
+        """Enhanced leader failure handling"""
+        self.leader_health_count += 1
+        
+        if error_code == grpc.StatusCode.FAILED_PRECONDITION:
+            logger.info("Connected node is not leader anymore")
+        elif error_code in (grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.DEADLINE_EXCEEDED):
+            logger.warning("Leader connection issue detected")
+        
+        # Reset connection if threshold reached
+        if self.leader_health_count >= self.leader_health_threshold:
+            with self.leader_lock:
+                self.current_leader = None
+                if self.master_channel:
+                    try:
+                        self.master_channel.close()
+                    except:
+                        pass
+                    self.master_channel = None
+                self.master_stub = None
+            logger.warning("Reset leader connection due to repeated failures")
+
 
     def RegisterWorker(self, request, context):
         """Handle registration requests (for other workers registering with this one)"""
