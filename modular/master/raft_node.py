@@ -32,7 +32,7 @@ class RaftState:
         self.leader_id = None
         self.current_term = 0
         self.voted_for = None
-        self.election_timeout = random.uniform(5.0, 10.0)
+        self.election_timeout = random.uniform(3.0, 5.0)
         self.last_heartbeat = time.time()
         self.commit_index = 0
         self.last_applied = 0
@@ -50,14 +50,16 @@ class RaftNode:
         self.redis_client = redis_client
         self.addr = addr  # Raft port, not used for gRPC directly
         self.peers = peers  # Now maps to service ports
-        self.heartbeat_interval = 5.0  # Leader sends heartbeats every 5s
-        self.election_timeout_min = 5.0  # Minimum election timeout
-        self.election_timeout_max = 10.0  # Maximum election timeout
+        self.heartbeat_interval = 3.0  # Leader sends heartbeats every 5s
+        self.election_timeout_min = 3.0  # Minimum election timeout
+        self.election_timeout_max = 5.0  # Maximum election timeout
         self.rpc_timeout = 3.0  # Timeout for RPC calls
         # Leader stability checks
         self.min_leader_stability = 15.0  # Minimum time to remain leader
         self.last_leadership_change = 0
         self.reset_election_timeout()
+        self.unreachable_peers = set()  # Track failed peers
+        self.peer_reconnect_interval = 30.0  # Try failed peers every 30s
 
         self.peer_channels = {
             peer_id: grpc.insecure_channel(peer_addr)
@@ -75,7 +77,7 @@ class RaftNode:
         self.voted_for = None
         self.leader_id = None
         self.last_heartbeat = time.time()
-        self.election_timeout = random.uniform(5.0, 10.0)
+        self.election_timeout = random.uniform(3.0, 5.0)
         self.stop_flag = False
         self.lock = threading.Lock()
         self.last_snapshot_time = time.time()
@@ -83,6 +85,21 @@ class RaftNode:
 
         # Initialize log with a dummy entry at index 0
         self.state.log.append(LogEntry(term=0, index=0, data=b''))
+
+
+    def _check_unreachable_peers(self):
+        """Periodically check if unreachable peers have recovered"""
+        if not hasattr(self, 'unreachable_peers') or not self.unreachable_peers:
+            return
+            
+        for peer_id in list(self.unreachable_peers):
+            try:
+                stub = self.peer_stubs[peer_id]
+                stub.GetLeader(database_pb2.Empty(), timeout=1.0)
+                logger.info(f"Peer {peer_id} has recovered, removing from unreachable set")
+                self.unreachable_peers.remove(peer_id)
+            except:
+                continue
 
     def set_master_node(self, master_node):
         """Set reference to master node for snapshots"""
@@ -190,7 +207,7 @@ class RaftNode:
             self.state.current_term += 1
             self.state.voted_for = self.node_id
             self.state.last_heartbeat = time.time()
-            self.state.election_timeout = random.uniform(.15, 10.0)
+            self.state.election_timeout = random.uniform(3.0, 5.0)
                 
             if self.on_state_change:
                     self.on_state_change(self.state)
@@ -203,6 +220,7 @@ class RaftNode:
     
     def _start_election(self):
         """Proper election with RequestVote RPCs"""
+
         with self.lock:
             if self.state.role != RaftRole.Candidate:
                 logger.info(f"Node {self.node_id} aborting election: no longer candidate")
@@ -227,7 +245,7 @@ class RaftNode:
                     logger.debug(f"Node {self.node_id} found peer {peer_id} unreachable")
                     continue
 
-            effective_nodes = max(2, reachable_peers + 1)
+            effective_nodes =  reachable_peers + 1
             required_votes = (effective_nodes // 2) + 1
             logger.debug(f"Node {self.node_id} calculated majority: {required_votes}/{effective_nodes} votes required")
 
@@ -238,6 +256,9 @@ class RaftNode:
 
             for peer_id, stub in self.peer_stubs.items():
                 try:
+                    # Skip peers we know are unreachable
+                    if hasattr(self, 'unreachable_peers') and peer_id in self.unreachable_peers:
+                        continue
                     logger.info(f"Node {self.node_id} requesting vote from {peer_id}")
                     response = stub.RequestVote(
                         database_pb2.VoteRequest(
@@ -273,12 +294,19 @@ class RaftNode:
             else:
                 logger.info(f"Node {self.node_id} did not receive majority votes ({votes}/{total_nodes}), remaining candidate")
                 # Randomize timeout to avoid split votes
-                self.state.election_timeout = random.uniform(5.0, 10.0)
+                self.state.election_timeout = random.uniform(3.0, 5.0)
                 self.state.last_heartbeat = time.time()
 
 
     def _become_leader(self):
         """Transition to leader state"""
+         # Only allow leadership change if it's been stable for min period
+        if (hasattr(self, '_last_leadership_change') and 
+        (time.time() - self._last_leadership_change < self.min_leader_stability)):
+            logger.warning("Leadership change too frequent! Remaining candidate.")
+            return
+            
+        self._last_leadership_change = time.time()
         if time.time() - self.last_leadership_change < self.min_leader_stability:
             logger.warning(f"Leadership change too frequent! Remaining candidate.")
             return
@@ -311,10 +339,12 @@ class RaftNode:
         if self.state.role != RaftRole.Leader:
             return
         successful_responses = 0
+        reachable_peers = 0  # Track actually reachable peers
+    
         responses = []
         logger.info(f"Node {self.node_id} sending heartbeats as leader for term {self.state.current_term}")
         for peer_id, stub in self.peer_stubs.items():
-            #try:
+            try:
                 # Prepare the request
                 next_idx = self.state.next_index.get(peer_id, 0)
                 prev_log_index = next_idx - 1
@@ -332,45 +362,87 @@ class RaftNode:
                         )
                         for e in self.state.log[next_idx:]
                     ]
-                    
-                response = stub.AppendEntries(
-                    database_pb2.AppendEntriesRequest(
-                        term=self.state.current_term,
-                        leader_id=self.node_id,
-                        prev_log_index=prev_log_index,
-                        prev_log_term=prev_log_term,
-                        entries=entries,
-                        leader_commit=self.state.commit_index
-                    ),
-                    timeout=self.rpc_timeout
-                )
 
-                print(f"response for heartbeat : " ,response)
-                if response.success:
-                     # Update nextIndex and matchIndex for follower
-                    self.state.next_index[peer_id] = next_idx + len(entries)
-                    self.state.match_index[peer_id] = self.state.next_index[peer_id] - 1
-                    
-                    # Update commit index if majority has replicated
-                    self._update_commit_index()
-                    successful_responses += 1
-                    responses.append(response.success)
-                else :
-                    if response.term > self.state.current_term:
-                        self._step_down(response.term)
-                        return
-                    else:
-                        # Decrement nextIndex and retry
-                        self.state.next_index[peer_id] = max(0, next_idx - 1)
+                # Skip if we know this peer is down (optional optimization)
+                if hasattr(self, 'unreachable_peers') and peer_id in self.unreachable_peers:
+                    continue
+
+                reachable_peers += 1
+                try : 
+                    response = stub.AppendEntries(
+                        database_pb2.AppendEntriesRequest(
+                            term=self.state.current_term,
+                            leader_id=self.node_id,
+                            prev_log_index=prev_log_index,
+                            prev_log_term=prev_log_term,
+                            entries=entries,
+                            leader_commit=self.state.commit_index
+                        ),
+                        timeout=self.rpc_timeout
+                    )
+
+                    print(f"response for heartbeat : " ,response)
+                    if response.success:
+                        # Update nextIndex and matchIndex for follower
+                        self.state.next_index[peer_id] = next_idx + len(entries)
+                        self.state.match_index[peer_id] = self.state.next_index[peer_id] - 1
+                        
+                        # Update commit index if majority has replicated
+                        self._update_commit_index()
+                        successful_responses += 1
+                        responses.append(response.success)
+                    else :
+                        if response.term > self.state.current_term:
+                            self._step_down(response.term)
+                            return
+                        else:
+                            # Decrement nextIndex and retry
+                            self.state.next_index[peer_id] = max(0, next_idx - 1)
+                except grpc.RpcError as e:
+                    # Mark peer as unreachable temporarily
+                    if not hasattr(self, 'unreachable_peers'):
+                        self.unreachable_peers = set()
+                    self.unreachable_peers.add(peer_id)
+                    logger.warning(f"Heartbeat to {peer_id} failed: {str(e)}")
+                    continue
                 #logger.info(f"Heartbeat sent to {peer_id}, response: success={response.success}")
             # except Exception as e:
             #     responses.append(False)
             #     logger.warning(f"Failed to send heartbeat to {peer_id}: {str(e)}")
             #     continue
+            except Exception as e:
+                logger.error(f"Unexpected error preparing heartbeat for {peer_id}: {str(e)}")
+                continue
 
-        # If less than half of peers respond, step down
-        if successful_responses < (len(self.peers) // 2):
-            self._step_down()
+        # Dynamic quorum calculation based on reachable peers
+        effective_quorum_size = max(1, (reachable_peers + 1) // 2)  # +1 for self
+        logger.debug(f"Effective quorum: {successful_responses+1}/{reachable_peers+1} (required: {effective_quorum_size})")
+
+        if (successful_responses + 1) < effective_quorum_size:
+            if not hasattr(self, '_heartbeat_failures'):
+                self._heartbeat_failures = 0
+            self._heartbeat_failures += 1
+
+          # Only step down after multiple consecutive failures
+            if self._heartbeat_failures >= 3:
+                logger.warning(f"Lost contact with majority of cluster, stepping down")
+                self._step_down()
+
+        # # If less than half of peers respond, step down
+        # if successful_responses < (len(self.peers) // 2):
+        #     # Add counter for consecutive failures
+        #     if not hasattr(self, '_heartbeat_failures'):
+        #         self._heartbeat_failures = 0
+        #     self._heartbeat_failures += 1
+            
+        #     # Only step down after 3 consecutive failures
+        #     if self._heartbeat_failures >= 3:
+        #         self._step_down()
+        else:
+            # Reset failure counter if we succeeded
+            if hasattr(self, '_heartbeat_failures'):
+                self._heartbeat_failures = 0
+
 
     def _update_commit_index(self):
         """Update commit index based on matchIndex of followers"""
