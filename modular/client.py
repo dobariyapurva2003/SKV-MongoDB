@@ -1,3 +1,5 @@
+import time
+import uuid
 import grpc
 import json
 import database_pb2
@@ -6,12 +8,33 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import List, Optional
  
 class DatabaseClient:
-    def __init__(self, master_address="localhost:50050"):
-        self.master_channel = grpc.insecure_channel(master_address)
-        self.master_stub = database_pb2_grpc.MasterServiceStub(self.master_channel)
+    def __init__(self, master_addresses: List[str] = ["localhost:50050"]):
+        self.master_addresses = master_addresses
+        self.current_master_index = 0
+        self.master_channel = None
+        self.master_stub = None
         self.current_db: Optional[str] = None
         self.worker_stub_cache = {}  # Cache for worker stubs
         self.executor = ThreadPoolExecutor(max_workers=10)
+        self.connect_to_master()
+
+    def connect_to_master(self):
+        """Try to connect to one of the available master servers"""
+        for i in range(len(self.master_addresses)):
+            try:
+                address = self.master_addresses[(self.current_master_index + i) % len(self.master_addresses)]
+                self.master_channel = grpc.insecure_channel(address)
+                self.master_stub = database_pb2_grpc.MasterServiceStub(self.master_channel)
+                # Test the connection
+                self.master_stub.GetLeader(database_pb2.Empty(), timeout=2)
+                self.current_master_index = (self.current_master_index + i) % len(self.master_addresses)
+                print(f"Connected to master at {address}")
+                return
+            except grpc.RpcError as e:
+                print(f"Failed to connect to master at {address}: {e.details()}")
+                continue
+        
+        raise ConnectionError("Could not connect to any master server")
 
     def get_leader(self) -> str:
         try:
@@ -86,8 +109,10 @@ class DatabaseClient:
                 return self.list_databases()
             elif cmd == "delete" and len(parts) == 2:
                 return self.delete_database(parts[1])
-            if cmd == "insert" and len(parts) >= 3:
-                return self.create_document(parts[1], " ".join(parts[2:]))
+            if cmd == "insert" and len(parts) >= 2:
+                    # New format without ID: "insert {json}"
+                    document_json = " ".join(parts[1:])
+                    return self.create_document(document_json)
             elif cmd == "read" and len(parts) == 2:
                 return self.read_document(parts[1])
             elif cmd == "readall":
@@ -119,14 +144,61 @@ class DatabaseClient:
         except Exception as e:
             return f"Error: {str(e)}"
 
-    def create_database(self, db_name: str , indexes: Optional[List[str]] = None) -> str:
-        master_addr = self.get_leader()
-        stub = database_pb2_grpc.MasterServiceStub(grpc.insecure_channel(master_addr))
-        response = stub.CreateDatabase(
-            database_pb2.DatabaseName(name=db_name , indexes=indexes if indexes else []  # Pass list of index fields)
-            )
-        )
-        return response.message
+    def create_database(self, db_name: str, indexes: Optional[List[str]] = None) -> str:
+        max_retries = len(self.master_addresses)
+        last_error = None
+        
+        for attempt in range(max_retries):
+            try:
+                # Try to get current leader
+                try:
+                    master_addr = self.get_leader()
+                    if master_addr.startswith("Failed"):
+                        raise grpc.RpcError(master_addr)
+                except grpc.RpcError:
+                    # If we can't get leader, try connecting to any master
+                    self.connect_to_master()
+                    master_addr = self.get_leader()
+                    if master_addr.startswith("Failed"):
+                        raise grpc.RpcError(master_addr)
+                
+                # Create channel with timeout
+                channel = grpc.insecure_channel(
+                    master_addr,
+                    options=[
+                        ('grpc.enable_retries', 1),
+                        ('grpc.keepalive_timeout_ms', 5000),
+                    ]
+                )
+                
+                stub = database_pb2_grpc.MasterServiceStub(channel)
+                response = stub.CreateDatabase(
+                    database_pb2.DatabaseName(
+                        name=db_name,
+                        indexes=indexes if indexes else []
+                    ),
+                    timeout=5  # 5 second timeout
+                )
+                return response.message
+                
+            except grpc.RpcError as e:
+                last_error = f"Attempt {attempt + 1}: RPC Error ({e.code().name}): {e.details()}"
+                print(f"Database creation failed: {last_error}")
+                
+                # Rotate to next master
+                self.current_master_index = (self.current_master_index + 1) % len(self.master_addresses)
+                self.connect_to_master()
+                
+                # Small delay before retry
+                time.sleep(0.5)
+                continue
+                
+            except Exception as e:
+                last_error = f"Attempt {attempt + 1}: Error: {str(e)}"
+                print(f"Database creation failed: {last_error}")
+                continue
+        
+        return f"Failed to create database after {max_retries} attempts. Last error: {last_error}"
 
     def use_database(self, db_name: str) -> str:
         try:
@@ -193,7 +265,7 @@ class DatabaseClient:
         response = stub.DeleteDatabase(database_pb2.DatabaseName(name=db_name))        
         return response.message
 
-    def create_document(self, doc_id: str, document_json: str) -> str:
+    def create_document(self, document_json: str) -> str:
         if not self.current_db:
             return "No database selected. Use 'use <db_name>' first."
         
@@ -211,6 +283,8 @@ class DatabaseClient:
                 self.current_worker = worker.worker
             
             worker_stub = self.get_worker_stub(self.current_worker)
+             # Generate a UUID if no ID was provided
+            doc_id = str(uuid.uuid4())
             response = worker_stub.CreateDocument(
                 database_pb2.DocumentRequest(
                     db_name=self.current_db,
@@ -468,11 +542,11 @@ class DatabaseClient:
 def main():
     import argparse
     parser = argparse.ArgumentParser(description='PSDB Client')
-    parser.add_argument('--master', default="localhost:50050",
-                       help='Master node address (host:port)')
+    parser.add_argument('--masters', nargs='+', default=["localhost:50050"],
+                       help='Master node addresses (host:port) separated by spaces')
     args = parser.parse_args()
 
-    client = DatabaseClient(master_address=args.master)
+    client = DatabaseClient(master_addresses=args.masters)
     print("PSDB Client - Distributed Document Database")
     print("Type 'exit' to quit. Commands:")
     print("  create <db>       - Create a new database")
