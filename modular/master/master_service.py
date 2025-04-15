@@ -497,7 +497,6 @@ class MasterService(database_pb2_grpc.MasterServiceServicer):
 
     def _select_worker_for_db(self, db_name: str) -> Optional[WorkerNode]:
         """Select the best worker for a new database"""
-        print(f"workers : " ,self.workers.values())
             # Get all healthy workers with lowest load
         healthy_workers = [
                 w for w in self.workers.values() 
@@ -505,7 +504,6 @@ class MasterService(database_pb2_grpc.MasterServiceServicer):
             ]
             
         if not healthy_workers:
-                print(f"there is no healthy workers")
                 return None
             
             # Sort by load, then by replica count
