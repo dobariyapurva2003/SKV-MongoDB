@@ -26,3 +26,7 @@ class WorkerNode:
         self.load = 0
         self.replica_count = 0
         self.last_heartbeat = time.time()
+        self.lock = threading.Lock()
+        self.failed_checks = 0
+        self.last_checked = 0
+        self.latency = 0
