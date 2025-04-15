@@ -464,7 +464,7 @@ class MasterNode:
                     
                     # Verify worker responsiveness
                     try:
-                        #worker.stub.ListDatabases(database_pb2.Empty(), timeout=2)
+                        worker.stub.ListDatabases(database_pb2.Empty(), timeout=2)
                         worker.health = True
                         worker.last_heartbeat = current_time
                     except:
