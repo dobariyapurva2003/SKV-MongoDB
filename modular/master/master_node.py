@@ -32,6 +32,7 @@ class MasterNode:
         # Persistent state for recovery
         self.state_file = f"raft_state_{node_id}.json"
         self._load_state()
+        self.stop_flag = False
 
         # Add collection tracking
         self.collection_assignments: Dict[str, Dict[str, str]] = {}  # {db_name: {collection_name: worker_address}}
@@ -49,10 +50,10 @@ class MasterNode:
         self.raft_node.redis_client = redis_client  # Set redis_client after initialization
         self.raft_node.service_port = service_port  # Pass service port to RaftNode
         
-        self.health_thread = threading.Thread(target=self._health_check, daemon=True)
-        self.health_thread.start()
+        self.health_thread = None
         self.raft_thread = threading.Thread(target=self._run_raft_loop, daemon=True)
         self.raft_thread.start()
+        self._start_health_check()  # New method to start health check
 
 
     def assign_collection(self, db_name: str, collection_name: str, worker_address: str) -> bool:
@@ -131,10 +132,33 @@ class MasterNode:
         if new_leader_id:
             logger.info(f"New leader elected: {new_leader_id}")
             if new_leader_id == self.node_id:
-                # We became leader - ensure our state is up to date
-                self._recover_state()
-        else:
-            logger.warning("No leader currently available")
+                # We became leader - start health checks
+                self._start_health_check()
+                # Immediately verify all workers
+                self._verify_all_workers()
+            else:
+                # We're no longer leader - stop health checks
+                self.stop_health_check()
+
+    def _start_health_check(self):
+        """Start or restart the health check thread"""
+        if self.health_thread and self.health_thread.is_alive():
+            return
+            
+        self.stop_health_check()  # Clean up any existing thread
+        self.stop_flag = False
+        self.health_thread = threading.Thread(target=self._health_check, daemon=True)
+        self.health_thread.start()
+        logger.info("Health check thread started")
+
+    def stop_health_check(self):
+        """Stop the health check thread"""
+        if self.health_thread:
+            self.stop_flag = True
+            self.health_thread.join(timeout=1)
+            if self.health_thread.is_alive():
+                logger.warning("Health check thread did not stop gracefully")
+            self.health_thread = None
 
     def _recover_state(self):
         """Recover state after becoming leader"""
@@ -240,7 +264,18 @@ class MasterNode:
 
     def apply_operation(self, operation: str, args: list):
             
-            if operation == "create_database":
+            if operation == "worker_healthy":
+                address = args[0]
+                if address in self.workers:
+                    self.workers[address].health = True
+                    self.workers[address].failed_checks = 0
+                    
+            elif operation == "worker_unhealthy":
+                address = args[0]
+                if address in self.workers:
+                    self.workers[address].health = False
+            
+            elif operation == "create_database":
                 db_name, worker_address = args
                 if db_name not in self.database_assignments:
                     self.database_assignments[db_name] = worker_address
@@ -450,22 +485,65 @@ class MasterNode:
                     0, self.workers[worker_address].replica_count - 1
                 )
 
-    def _health_check(self):
-        while True:
-            time.sleep(5)
-            current_time = time.time()
-            
-            with self.lock:
-                # Mark unresponsive workers
-                for address, worker in list(self.workers.items()):
-                    if current_time - worker.last_heartbeat > 15:
-                        logger.warning(f"Worker {address} marked unhealthy")
-                        worker.health = False
-                    
-                    # Verify worker responsiveness
-                    try:
-                        worker.stub.ListDatabases(database_pb2.Empty(), timeout=2)
+    def _verify_all_workers(self):
+        """Immediately verify all workers when becoming leader"""
+        with self.lock:
+            for address, worker in list(self.workers.items()):
+                try:
+                    with worker.lock:
+                        worker.stub.GetLoadInfo(database_pb2.Empty(), timeout=1)
                         worker.health = True
-                        worker.last_heartbeat = current_time
-                    except:
+                        worker.failed_checks = 0
+                        worker.last_heartbeat = time.time()
+                except:
+                    with worker.lock:
                         worker.health = False
+        logger.info("Completed initial worker verification")
+
+    def _health_check(self):
+        """Improved health check with leader verification"""
+        logger.info("Health check thread running")
+        while not self.stop_flag and self.is_leader():  # Only run if we're leader
+            try:
+                current_time = time.time()
+                responsive_workers = set()
+
+                with self.lock:
+                    for address, worker in list(self.workers.items()):
+                        try:
+                            with worker.lock:
+                                if current_time - worker.last_checked < 2:
+                                    continue
+
+                                worker.last_checked = current_time
+                                response = worker.stub.GetLoadInfo(database_pb2.Empty(), timeout=2)
+                                
+                                worker.failed_checks = 0
+                                worker.last_heartbeat = current_time
+                                worker.health = True
+                                responsive_workers.add(address)
+
+                        except Exception as e:
+                            with worker.lock:
+                                worker.failed_checks += 1
+                                if worker.failed_checks >= 2:
+                                    worker.health = False
+                                    logger.warning(f"Worker {address} marked unhealthy")
+
+                # Dynamic sleep based on cluster health
+                unhealthy_count = sum(1 for w in self.workers.values() if not w.health)
+                sleep_time = max(1.0, 3.0 - unhealthy_count)
+                time.sleep(sleep_time)
+
+            except Exception as e:
+                logger.error(f"Health check error: {str(e)}")
+                time.sleep(1)
+
+        logger.info("Health check thread stopping")
+
+
+    def _replicate_worker_status(self, worker_address: str, is_healthy: bool):
+        """Replicate worker status changes across the cluster"""
+        if self.is_leader():
+            operation = "worker_healthy" if is_healthy else "worker_unhealthy"
+            self._replicate_operation(operation, worker_address)
