@@ -13,8 +13,7 @@ insert {"name":"jiya","age":23}
 readll
 read <doc_id>
 delete_doc <doc_id>
-query "lambda doc: 'age' in doc and doc['age'] < 35"
-query "lambda doc: doc.get('age') <= 30"
+query "lambda doc: 'age' in doc and doc['age'] == 35"
 query "lambda doc: doc.get('age') == 34"
 query "lambda doc: doc.get('name') == 'pina'"
 query "lambda doc: doc['name'] == 'pina'"
