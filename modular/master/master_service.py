@@ -108,7 +108,23 @@ class MasterService(database_pb2_grpc.MasterServiceServicer):
                 logger.info(f"Rejecting heartbeat from {request.worker_address} - not leader")
                 context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
                 return database_pb2.HeartbeatResponse(acknowledged=False)
+            
             logger.info(f"Received heartbeat from worker {request.worker_address}")
+            # Add or update the worker in our list
+            worker_address = request.worker_address
+            if worker_address not in self.master.workers:
+                    logger.info(f"Adding new worker {worker_address} from heartbeat")
+                    self.master.workers[worker_address] = WorkerNode(worker_address)
+                    if self.is_leader():
+                        # Replicate the addition across the cluster
+                        self.master._replicate_operation("add_worker", worker_address)
+                
+                # Update the worker's status
+            worker = self.master.workers[worker_address]
+            worker.last_heartbeat = time.time()
+            worker.health = True
+            worker.failed_checks = 0
+        
             response = database_pb2.HeartbeatResponse(acknowledged=True)
             return response
         except Exception as e:
