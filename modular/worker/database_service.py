@@ -378,6 +378,30 @@ class DatabaseService(database_pb2_grpc.WorkerServiceServicer):
             
             time.sleep(self.heartbeat_interval)
 
+    def _update_database_list(self, db_name: str, action: str = 'add') -> None:
+        """Maintain a single file with all database names"""
+        db_list_file = "databases.json"
+        try:
+            # Read existing list
+            db_list = []
+            if os.path.exists(db_list_file):
+                with open(db_list_file, 'r') as f:
+                    db_list = json.load(f).get('databases', [])
+            
+            # Update list
+            if action == 'add' and db_name not in db_list:
+                db_list.append(db_name)
+            elif action == 'remove' and db_name in db_list:
+                db_list.remove(db_name)
+            
+            # Write back to file
+            with open(db_list_file, 'w') as f:
+                json.dump({'databases': db_list}, f)
+                
+        except Exception as e:
+            logger.error(f"Failed to update database list: {str(e)}")
+
+
 
     def _handle_leader_failure(self, error_code=None):
         """Enhanced leader failure handling"""
@@ -420,6 +444,8 @@ class DatabaseService(database_pb2_grpc.WorkerServiceServicer):
         """Decrement the reported replica count (used when replication fails)"""
         return database_pb2.OperationResponse(success=True)
 
+
+
     def CreateDatabase(self, request, context):
         try:
             db_file = f"{request.name}.json"
@@ -442,6 +468,9 @@ class DatabaseService(database_pb2_grpc.WorkerServiceServicer):
                 json.dump({}, f)
                 f.flush()
                 os.fsync(f.fileno())
+
+            # Update the central database list
+            self._update_database_list(request.name, 'add')
 
             # Initialize IndexManager
             index_manager = IndexManager()
@@ -524,8 +553,16 @@ class DatabaseService(database_pb2_grpc.WorkerServiceServicer):
     
     
     def ListDatabases(self, request, context):
-        dbs = list(self.manager.databases.keys())
-        return database_pb2.DatabaseList(names=dbs)
+        try:
+            db_list_file = "databases.json"
+            if os.path.exists(db_list_file):
+                with open(db_list_file, 'r') as f:
+                    db_list = json.load(f).get('databases', [])
+                return database_pb2.DatabaseList(names=db_list)
+            return database_pb2.DatabaseList(names=list(self.manager.databases.keys()))
+        except Exception as e:
+            logger.error(f"Error listing databases: {str(e)}")
+            return database_pb2.DatabaseList(names=list(self.manager.databases.keys()))
     
     def DeleteDatabase(self, request, context):
         try:
@@ -536,6 +573,8 @@ class DatabaseService(database_pb2_grpc.WorkerServiceServicer):
                 if (self.manager.current_db and 
                     self.manager.current_db.db_file == f"{request.name}.json"):
                     self.manager.current_db = None
+                 # Update the central database list
+                self._update_database_list(request.name, 'remove')
                 return database_pb2.OperationResponse(
                     success=True,
                     message=f"Database '{request.name}' deleted"
