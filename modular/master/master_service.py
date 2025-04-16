@@ -120,6 +120,7 @@ class MasterService(database_pb2_grpc.MasterServiceServicer):
     def GetLeader(self, request, context):
         leader_id = self.master.raft_node.state.leader_id
         leader_addr = self.master.raft_node.get_leader_addr()
+        print(f"from master services , : " , leader_addr)
         return database_pb2.LeaderInfo(
             leader_id=leader_id or "",
             leader_address=leader_addr or ""
