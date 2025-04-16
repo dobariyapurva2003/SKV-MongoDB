@@ -34,6 +34,7 @@ class DatabaseClient:
                 continue
 
             try:
+                # Create a new channel for this attempt
                 channel = grpc.insecure_channel(
                     address,
                     options=[
@@ -42,34 +43,54 @@ class DatabaseClient:
                     ]
                 )
                 stub = database_pb2_grpc.MasterServiceStub(channel)
-                response = stub.GetLeader(database_pb2.Empty(), timeout=5)
                 
-                # Check if this master is the leader
-                leader_addr = response.leader_addr if hasattr(response, 'leader_addr') else address
-                if leader_addr and leader_addr != address:
-                    print(f"Master at {address} is not leader; redirecting to {leader_addr}")
-                    # Try to connect to the leader
-                    if leader_addr in self.master_addresses and leader_addr not in attempted_addresses:
-                        channel.close()
-                        address = leader_addr
+                # Get the current leader information
+                response = stub.GetLeader(database_pb2.Empty(), timeout=5)
+                print(f"master is : " , response)
+                # If the current node is not the leader, follow the redirect
+                if hasattr(response, 'leader_address') and response.leader_address and response.leader_address != address:
+                    print(f"Master at {address} is not leader; redirecting to {response.leader_address}")
+                    
+                    # Close the current channel before redirecting
+                    channel.close()
+                    
+                    # Update the address to the leader's address
+                    address = response.leader_address
+                    print(f"final leader address is : " , address)
+                    
+                    # If the leader is in our master list, update the current index
+                    if address in self.master_addresses:
                         self.current_master_index = self.master_addresses.index(address)
-                        channel = grpc.insecure_channel(
-                            address,
-                            options=[
-                                ('grpc.enable_retries', 1),
-                                ('grpc.keepalive_timeout_ms', 5000),
-                            ]
-                        )
-                        stub = database_pb2_grpc.MasterServiceStub(channel)
-                        # Verify the new connection
-                        stub.GetLeader(database_pb2.Empty(), timeout=5)
-                    else:
-                        print(f"Leader address {leader_addr} not in master_addresses or already attempted")
+                    
+                    # Create a new channel to the leader
+                    channel = grpc.insecure_channel(
+                        address,
+                        options=[
+                            ('grpc.enable_retries', 1),
+                            ('grpc.keepalive_timeout_ms', 5000),
+                        ]
+                    )
+                    stub = database_pb2_grpc.MasterServiceStub(channel)
+                    
+                    # Verify the new connection is indeed the leader
+                    try:
+                        leader_response = stub.GetLeader(database_pb2.Empty(), timeout=5)
+                        if hasattr(leader_response, 'leader_addr') and leader_response.leader_addr and leader_response.leader_addr != address:
+                            # If we're redirected again, continue the loop
+                            attempted_addresses.add(address)
+                            self.current_master_index = (self.current_master_index + 1) % len(self.master_addresses)
+                            attempt += 1
+                            channel.close()
+                            continue
+                    except grpc.RpcError:
+                        # If verification fails, continue the loop
                         attempted_addresses.add(address)
                         self.current_master_index = (self.current_master_index + 1) % len(self.master_addresses)
                         attempt += 1
+                        channel.close()
                         continue
 
+                # If we get here, we're connected to the leader
                 self.master_channel = channel
                 self.master_stub = stub
                 DatabaseClient.current_master_addr = address
@@ -81,25 +102,63 @@ class DatabaseClient:
                 attempted_addresses.add(address)
                 self.current_master_index = (self.current_master_index + 1) % len(self.master_addresses)
                 attempt += 1
-                channel.close() if 'channel' in locals() else None
+                if 'channel' in locals():
+                    channel.close()
                 continue
 
         raise ConnectionError("Could not connect to any master leader")
+    
 
     def get_leader(self) -> str:
         """Return the current master address or rediscover the leader."""
         if DatabaseClient.current_master_addr:
             try:
+                # Verify the current connection is still the leader
                 response = self.master_stub.GetLeader(database_pb2.Empty(), timeout=2)
-                leader_addr = response.leader_addr if hasattr(response, 'leader_addr') else DatabaseClient.current_master_addr
-                if leader_addr != DatabaseClient.current_master_addr:
-                    print(f"Current master {DatabaseClient.current_master_addr} is not leader; redirecting to {leader_addr}")
+                
+                # If we're not connected to the leader, reconnect
+                if hasattr(response, 'leader_addr') and response.leader_addr and response.leader_addr != DatabaseClient.current_master_addr:
+                    print(f"Current master {DatabaseClient.current_master_addr} is not leader; redirecting to {response.leader_addr}")
                     self.connect_to_master()
+                
                 return DatabaseClient.current_master_addr
             except grpc.RpcError:
-                pass
+                # If verification fails, reconnect
+                self.connect_to_master()
+                return DatabaseClient.current_master_addr
+        
+        # If no current connection, establish a new one
         self.connect_to_master()
         return DatabaseClient.current_master_addr
+
+
+    def execute_command(self, command: str) -> str:
+        parts = command.strip().split()
+        if not parts:
+            return "Empty command"
+
+        cmd = parts[0].lower()
+        try:
+            # Before executing any command, ensure we're connected to the leader
+            self.get_leader()
+            
+            # [Rest of the execute_command method remains unchanged...]
+            if cmd == "create" and len(parts) >= 2:
+                return self.create_database(parts[1], eval(" ".join(parts[2:])) if len(parts) > 2 else [])
+            # [Other command handling remains unchanged...]
+            
+        except grpc.RpcError as e:
+            if e.code() in (grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.DEADLINE_EXCEEDED):
+                print(f"RPC Error ({e.code().name}): {e.details()}")
+                try:
+                    self.connect_to_master()
+                    return self.execute_command(command)
+                except ConnectionError as ce:
+                    return f"Failed to reconnect: {str(ce)}"
+            return f"RPC Error ({e.code().name}): {e.details()}"
+        except Exception as e:
+            return f"Error: {str(e)}"
+        
 
     def get_worker_address(self, worker_msg):
         """Extract worker address from different possible formats."""
