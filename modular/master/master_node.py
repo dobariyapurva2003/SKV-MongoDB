@@ -45,7 +45,7 @@ class MasterNode:
             redis_client=redis_client,
             on_leader_change=self._on_leader_change,
             on_state_change=self._on_state_change,
-            on_apply=self._on_apply ,        )
+            on_apply=self._on_apply        )
         self.raft_node.set_master_node(self)  # Add this line
         self.raft_node.redis_client = redis_client  # Set redis_client after initialization
         self.raft_node.service_port = service_port  # Pass service port to RaftNode
@@ -533,6 +533,7 @@ class MasterNode:
                 with self.lock:
                     for address, worker in list(self.workers.items()):
                         #try:
+                            with worker.lock:
                                 print(f"inside lock")
                                 if current_time - worker.last_checked < 2:
                                     continue
