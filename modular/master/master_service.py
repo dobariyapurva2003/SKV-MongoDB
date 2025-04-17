@@ -120,7 +120,6 @@ class MasterService(database_pb2_grpc.MasterServiceServicer):
     def GetLeader(self, request, context):
         leader_id = self.master.raft_node.state.leader_id
         leader_addr = self.master.raft_node.get_leader_addr()
-        print(f"from master services , : " , leader_addr)
         return database_pb2.LeaderInfo(
             leader_id=leader_id or "",
             leader_address=leader_addr or ""
@@ -903,6 +902,77 @@ class MasterService(database_pb2_grpc.MasterServiceServicer):
                 success=False,
                 message=str(e)
             )
+
+
+
+    def UpdateLogDocument(self, request, context):
+        try:
+            print(f"update log document")
+            logger.info(f"UpdateDocument: db={request.db_name}, doc_id={request.doc_id}")
+            
+            # Get the worker address where the document resides
+            worker_addr = self.master.get_document_worker(request.db_name, request.doc_id)
+            if not worker_addr:
+                context.set_code(grpc.StatusCode.NOT_FOUND)
+                context.set_details(f"Document '{request.doc_id}' not found on worker")
+                return database_pb2.OperationResponse(
+                    success=False,
+                    message="Document not found"
+                )
+            
+            try:
+                channel = grpc.insecure_channel(worker_addr)
+                stub = database_pb2_grpc.MasterServiceStub(channel)
+                
+                # Read the document from the worker
+                doc_response = stub.ReadDocument(database_pb2.DocumentID(
+                    db_name=request.db_name,
+                    doc_id=request.doc_id
+                ))
+                
+                if not doc_response.document:
+                    context.set_code(grpc.StatusCode.NOT_FOUND)
+                    return database_pb2.OperationResponse(
+                        success=False,
+                        message="Document not found on worker"
+                    )
+                
+                # Apply the updates
+                updates = json.loads(request.updates)
+                updated_doc = json.loads(doc_response.document)
+                updated_doc.update(updates)
+                updated_doc['_updated_at'] = datetime.now().isoformat()
+                updated_doc['_version'] = updated_doc.get('_version', 0) + 1
+                
+                # Send the update request back to the worker
+                update_response = stub.UpdateLogDocument(
+                    database_pb2.UpdateRequest(
+                        db_name=request.db_name,
+                        doc_id=request.doc_id,
+                        updates=json.dumps(updates)
+                    )
+                )
+                
+                return update_response
+
+            except Exception as e:
+                logger.error(f"Update failed: {str(e)}")
+                context.set_code(grpc.StatusCode.INTERNAL)
+                return database_pb2.OperationResponse(
+                    success=False,
+                    message=str(e)
+                )
+                
+        except Exception as e:
+            logger.error(f"Error in UpdateDocument: {str(e)}")
+            context.set_code(grpc.StatusCode.INTERNAL)
+            return database_pb2.OperationResponse(
+                success=False,
+                message=str(e)
+            )
+
+
+
 
     def DeleteDocument(self, request, context):
         worker = self.GetPrimaryWorker(database_pb2.DatabaseName(name=request.db_name), context)
