@@ -16,6 +16,7 @@ service MasterService {
   rpc GetDocumentReplicas (DocumentID) returns (WorkerList);
   rpc DecrementReplicaCount (DecrementReplicaCountRequest) returns (DecrementResponse);
   rpc CreateDatabase (DatabaseName) returns (OperationResponse);
+  rpc UpdateLogDocument (UpdateRequest) returns (OperationResponse);
   rpc UseDatabase (DatabaseName) returns (OperationResponse);
   rpc ListDatabases (Empty) returns (DatabaseList);
   rpc GetPrimaryWorker (DatabaseName) returns (Worker);  // New RPC
@@ -45,6 +46,7 @@ service WorkerService {
   rpc Heartbeat (HeartbeatRequest) returns (HeartbeatResponse);
   rpc AddWorker (Worker) returns (OperationResponse);
   rpc InstallSnapshot (InstallSnapshotRequest) returns (InstallSnapshotResponse);
+  rpc UpdateLogDocument (UpdateRequest) returns (OperationResponse);
   
   rpc ListWorkers (Empty) returns (WorkerList);
   rpc GetDocumentReplicas (DocumentID) returns (WorkerList);
