@@ -65,6 +65,7 @@ class MasterNode:
         
     def get_collection_worker(self, db_name: str, collection_name: str) -> Optional[str]:
         """Get worker assigned to a collection"""
+        print(f"list of workers : " ,self.collection_assignments.get(db_name, {}).get(collection_name))
         return self.collection_assignments.get(db_name, {}).get(collection_name)
     
     def get_document_worker(self, db_name: str, collection_name: str, doc_id: str) -> Optional[str]:
@@ -534,7 +535,6 @@ class MasterNode:
                     for address, worker in list(self.workers.items()):
                         #try:
                             with worker.lock:
-                                print(f"inside lock")
                                 if current_time - worker.last_checked < 2:
                                     continue
 
