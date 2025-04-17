@@ -31,6 +31,7 @@ class DatabaseManager:
             'db': SimpleJSONDB(f"{db_name}.json"),
             'shards': ShardMetadata()
         }
+        
         return self.databases[db_name]['db']
     
     def use_database(self, db_name: str) -> SimpleJSONDB:
@@ -60,3 +61,15 @@ class DatabaseManager:
         for field, index in self.current_db['index_manager'].indexes.items():
             if field in document:
                 self.current_db['index_manager'].insert(field, document[field], doc_id)
+
+    def read_document(self, doc_id: str) -> Optional[Dict]:
+        """Read a document by its ID from the current database."""
+        if not self.current_db:
+            raise ValueError("No database selected. Call use_database first.")
+        
+        try:
+            return self.current_db['db'].read_document(doc_id)
+        except Exception as e:
+            print(f"Error reading document {doc_id}: {e}")
+            return None
+
