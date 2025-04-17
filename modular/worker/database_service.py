@@ -18,11 +18,13 @@ from .simpleJSON import SimpleJSONDB
 from .shard_metadata import ShardMetadata
 from .index import BPlusTree , BPlusTreeNode , IndexManager
 from .database_manager import DatabaseManager
+from .request_logger import log_request
 
 class DatabaseService(database_pb2_grpc.WorkerServiceServicer):
     def __init__(self, worker_address: str, master_addresses: str):
         self.manager = DatabaseManager()
         self.worker_address = worker_address
+        self.worker_port = int(worker_address.split(":")[-1])  # Extract port
         self.master_addresses = master_addresses
         self.current_leader: Optional[str] = None
         self.known_workers: List[str] = [worker_address]
@@ -365,6 +367,7 @@ class DatabaseService(database_pb2_grpc.WorkerServiceServicer):
                     )
                     
                     if response.acknowledged:
+                        logger.info(f"Heartbeat acknowledged by leader.")
                         self.leader_health_count = max(0, self.leader_health_count - 1)
                     else:
                         self._handle_leader_failure()
@@ -449,7 +452,7 @@ class DatabaseService(database_pb2_grpc.WorkerServiceServicer):
     def CreateDatabase(self, request, context):
         try:
             db_file = f"{request.name}.json"
-            
+            log_request(self.worker_port, f"CreateDatabase request: db={request.name}")
             # Double-check with file system
             if os.path.exists(db_file):
                 try:
@@ -511,6 +514,7 @@ class DatabaseService(database_pb2_grpc.WorkerServiceServicer):
     def UseDatabase(self, request, context):
         try:
             db_file = f"{request.name}.json"
+            log_request(self.worker_port, f"UseDatabase request: db={request.name}")
             print(f"Looking for database file at: {os.path.abspath(db_file)}")  # Add this
             print(f"File exists: {os.path.exists(db_file)}")  # Add this
 
@@ -571,7 +575,7 @@ class DatabaseService(database_pb2_grpc.WorkerServiceServicer):
                     os.remove(f"{request.name}.json")
                 del self.manager.databases[request.name]
                 if (self.manager.current_db and 
-                    self.manager.current_db.db_file == f"{request.name}.json"):
+                    self.manager.current_db['db'].db_file == f"{request.name}.json"):
                     self.manager.current_db = None
                  # Update the central database list
                 self._update_database_list(request.name, 'remove')
@@ -591,7 +595,6 @@ class DatabaseService(database_pb2_grpc.WorkerServiceServicer):
     
     def CreateDocument(self, request, context):
         try:
-            
             logger.info(f"CreateDocument received for db={request.db_name}, doc_id={request.doc_id}")
             
             #if not self.manager.current_db or self.manager.current_db['db'].db_file != f"{request.db_name}.json":
@@ -607,6 +610,8 @@ class DatabaseService(database_pb2_grpc.WorkerServiceServicer):
                 '_primary': request.doc_id is not None,
                 '_version': 1
             }
+            log_request(self.worker_port, f"CreateDocument request: db={request.db_name}, doc_id={request.doc_id}, content={doc_data}")
+
             
             # Store document locally
             # self.manager.current_db['db'].create_document(doc_data, doc_id)
@@ -662,6 +667,14 @@ class DatabaseService(database_pb2_grpc.WorkerServiceServicer):
             context.set_details(str(e))
             return database_pb2.DocumentID()
     
+
+
+  
+
+
+
+
+
     def _compensate_replicas(self, db_name: str, doc_id: str, doc_data: Dict, 
                             existing_replicas: List[str]) -> None:
         """Create additional replicas if initial replication failed"""
@@ -749,6 +762,8 @@ class DatabaseService(database_pb2_grpc.WorkerServiceServicer):
     def ReadDocument(self, request, context):
         try:
             logger.info(f"ReadDocument: db={request.db_name} doc_id={request.doc_id}")
+            log_request(self.worker_port, f"ReadDocument: db={request.db_name}, doc_id={request.doc_id}")
+
             
             # Ensure correct database is loaded
             if not self.manager.current_db or self.manager.current_db['db'].db_file != f"{request.db_name}.json":
@@ -793,6 +808,7 @@ class DatabaseService(database_pb2_grpc.WorkerServiceServicer):
 
     def ReadAllDocuments(self, request, context):
         try:
+            log_request(self.worker_port, f"ReadAllDocument")
             if not self.manager.current_db or self.manager.current_db['db'].db_file != f"{request.name}.json":
                 self.manager.use_database(request.name)
             docs = self.manager.current_db['db'].read_all_documents()
@@ -889,6 +905,7 @@ class DatabaseService(database_pb2_grpc.WorkerServiceServicer):
     def QueryDocuments(self, request, context):
         try:
             logger.info(f"QueryDocuments called on db={request.db_name} with filter_expr={request.filter_expr}")
+            log_request(self.worker_port, f"QueryDocuments called on db={request.db_name} with filter_expr={request.filter_expr}")
             self.manager.use_database(request.db_name)
 
             filter_expr = request.filter_expr
@@ -931,7 +948,22 @@ class DatabaseService(database_pb2_grpc.WorkerServiceServicer):
             return database_pb2.DocumentList(documents=[])
 
 
-
+    def apply_local_update(self, db_name: str, doc_id: str, updates: Dict):
+        """Applies an update to a document locally without replication or contacting master"""
+        self.UseDatabase(database_pb2.DatabaseName(name=db_name), None)
+        try:
+            # Read the document
+            #document = self.manager.current_db['db'].read_document(doc_id)
+            document = self.ReadDocument(database_pb2.DocumentID(db_name=db_name, doc_id=doc_id),None)
+            print(f"document locally readed : " , document)
+            # Apply updates
+            for key, value in updates.items():
+                document[key] = value
+            # Write updated document
+            self.manager.write_document(doc_id, document)
+            logger.info(f"Locally updated document {doc_id} in DB {db_name}")
+        except Exception as e:
+            logger.error(f"Failed to apply local update to document {doc_id} in DB {db_name}: {e}")
 
 
 
@@ -943,12 +975,23 @@ class DatabaseService(database_pb2_grpc.WorkerServiceServicer):
             if not self.manager.current_db or self.manager.current_db['db'].db_file != f"{request.db_name}.json":
                 logger.info(f"Switching to database {request.db_name}")
                 self.manager.use_database(request.db_name)
+                if not self.manager.current_db:
+                    logger.error(f"Failed to switch to database {request.db_name}")
+                    if context is not None:
+                        context.set_code(grpc.StatusCode.INTERNAL)
+                        context.set_details(f"Database {request.db_name} not found")
+                    return database_pb2.OperationResponse(success=False, message=f"Database {request.db_name} not found")
 
             # Step 2: Retrieve document
+            logger.debug(f"Attempting to read document {request.doc_id} from {self.manager.current_db['db'].db_file}")
             current_doc = self.manager.current_db['db'].read_document(request.doc_id)
             if not current_doc:
-                logger.info(f"Document {request.doc_id} not found in {request.db_name}")
-                context.set_code(grpc.StatusCode.NOT_FOUND)
+                logger.warning(f"Document {request.doc_id} not found in {request.db_name}")
+                if context is not None:
+                    context.set_code(grpc.StatusCode.NOT_FOUND)
+                    context.set_details("Document not found")
+                else:
+                    logger.info(f"Document {request.doc_id} not found during log replay")
                 return database_pb2.OperationResponse(success=False, message="Document not found")
 
             logger.info(f"Found document {request.doc_id}: {current_doc}")
@@ -971,16 +1014,18 @@ class DatabaseService(database_pb2_grpc.WorkerServiceServicer):
 
             # Step 4: Prepare index update
             updates = json.loads(request.updates)
+            log_request(self.worker_port, f"UpdateDocument: db={request.db_name}, doc_id={request.doc_id}, updates={updates}")
             index_manager = self.manager.current_db['index_manager']
             for field, index in index_manager.indexes.items():
                 if field in current_doc:
-                    index.delete(current_doc[field], request.doc_id)  # remove old value
+                    index.delete(current_doc[field], request.doc_id)  # Remove old value
 
             # Step 5: Perform update
             current_doc.update(updates)
             current_doc['_updated_at'] = datetime.now().isoformat()
             current_doc['_version'] = current_doc.get('_version', 0) + 1
             self.manager.current_db['db']._save()
+            logger.debug(f"Document {request.doc_id} updated locally: {current_doc}")
 
             # Step 6: Insert updated values into index
             for field, index in index_manager.indexes.items():
@@ -996,10 +1041,79 @@ class DatabaseService(database_pb2_grpc.WorkerServiceServicer):
 
         except Exception as e:
             logger.error(f"UpdateDocument failed: {str(e)}", exc_info=True)
-            context.set_code(grpc.StatusCode.INTERNAL)
+            if context is not None:
+                context.set_code(grpc.StatusCode.INTERNAL)
+                context.set_details(str(e))
+            return database_pb2.OperationResponse(success=False, message=f"Update failed: {str(e)}")
+        
+        
+        
+
+
+
+    def UpdateLogDocument(self, request, context):
+        try:
+            logger.info(f"UpdateDocument: db={request.db_name}, doc_id={request.doc_id}")
+
+            # Step 1: Ensure correct database
+            if not self.manager.current_db or self.manager.current_db['db'].db_file != f"{request.db_name}.json":
+                logger.info(f"Switching to database {request.db_name}")
+                self.manager.use_database(request.db_name)
+                if not self.manager.current_db:
+                    logger.error(f"Failed to switch to database {request.db_name}")
+                    if context is not None:
+                        context.set_code(grpc.StatusCode.INTERNAL)
+                        context.set_details(f"Database {request.db_name} not found")
+                    return database_pb2.OperationResponse(success=False, message=f"Database {request.db_name} not found")
+
+            # Step 2: Retrieve document
+            logger.debug(f"Attempting to read document {request.doc_id} from {self.manager.current_db['db'].db_file}")
+            current_doc = self.manager.current_db['db'].read_document(request.doc_id)
+            if not current_doc:
+                logger.warning(f"Document {request.doc_id} not found in {request.db_name}")
+                if context is not None:
+                    context.set_code(grpc.StatusCode.NOT_FOUND)
+                    context.set_details("Document not found")
+                else:
+                    logger.info(f"Document {request.doc_id} not found during log replay")
+                return database_pb2.OperationResponse(success=False, message="Document not found")
+
+            logger.info(f"Found document {request.doc_id}: {current_doc}")
+
+            # Step 3: Prepare index update
+            updates = json.loads(request.updates)
+            log_request(self.worker_port, f"UpdateDocument: db={request.db_name}, doc_id={request.doc_id}, updates={updates}")
+            index_manager = self.manager.current_db['index_manager']
+            for field, index in index_manager.indexes.items():
+                if field in current_doc:
+                    index.delete(current_doc[field], request.doc_id)  # Remove old value
+
+            # Step 4: Perform update
+            current_doc.update(updates)
+            current_doc['_updated_at'] = datetime.now().isoformat()
+            current_doc['_version'] = current_doc.get('_version', 0) + 1
+            self.manager.current_db['db']._save()
+            logger.debug(f"Document {request.doc_id} updated locally: {current_doc}")
+
+            # Step 5: Insert updated values into index
+            for field, index in index_manager.indexes.items():
+                if field in updates:
+                    index.insert(updates[field], request.doc_id)
+
+            logger.info(f"Document {request.doc_id} updated locally: {current_doc}")
+            return database_pb2.OperationResponse(success=True, message="Document updated locally")
+
+        except Exception as e:
+            logger.error(f"UpdateDocument failed: {str(e)}", exc_info=True)
+            if context is not None:
+                context.set_code(grpc.StatusCode.INTERNAL)
+                context.set_details(str(e))
             return database_pb2.OperationResponse(success=False, message=f"Update failed: {str(e)}")
 
-    
+
+
+
+
 
     def _replicate_document(self, db_name: str, doc_id: str, current_doc: dict) -> str:
         """Handle replication to secondary workers"""
@@ -1055,6 +1169,7 @@ class DatabaseService(database_pb2_grpc.WorkerServiceServicer):
     def DeleteDocument(self, request, context):
         try:
             logger.info(f"DeleteDocument: db={request.db_name}, doc_id={request.doc_id}")
+            log_request(self.worker_port, f"DeleteDocument: db={request.db_name}, doc_id={request.doc_id}")
 
             if not self.manager.current_db or self.manager.current_db['db'].db_file != f"{request.db_name}.json":
                 self.manager.use_database(request.db_name)
@@ -1150,9 +1265,10 @@ class DatabaseService(database_pb2_grpc.WorkerServiceServicer):
 
     def ClearDatabase(self, request, context):
         try:
-            if not self.manager.current_db or self.manager.current_db.db_file != f"{request.name}.json":
+            log_request(self.worker_port, f"ClearDatabase: db={request.db_name}")
+            if not self.manager.current_db or self.manager.current_db['db'].db_file != f"{request.name}.json":
                 self.manager.use_database(request.name)
-            self.manager.current_db.clear_database()
+            self.manager.current_db['db'].clear_database()
             return database_pb2.OperationResponse(
                 success=True,
                 message="Database cleared"
